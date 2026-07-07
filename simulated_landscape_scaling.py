@@ -325,15 +325,18 @@ def valid_neighbor_groups(
     valid_sizes = set(partner_counts)
     group_set = set(group)
     neighbors = []
+    # Add one partner.
     for partner in partners:
         if partner not in group_set:
             candidate = tuple(sorted((*group, partner)))
             if len(candidate) in valid_sizes:
                 neighbors.append(candidate)
+    # Remove one partner.
     for partner in group:
         candidate = tuple(item for item in group if item != partner)
         if len(candidate) in valid_sizes:
             neighbors.append(candidate)
+    # Swap one present partner for one absent partner.
     for old_partner in group:
         for new_partner in partners:
             if new_partner in group_set:
