@@ -72,7 +72,7 @@ Parameter notes:
 - `--budgets`: measured-row checkpoints used to train/evaluate models and estimate how many measurements are needed.
 - `--batch-size`: acquisition batch size for Bayesian optimization. It does not control the reporting checkpoints when `--budgets` is explicit.
 - `--seeds`: number of independent landscape/acquisition repeats.
-- `--models`: surrogate models trained at each measured-row budget. `gnn` requires PyTorch and is much slower than the sklearn models.
+- `--models`: surrogate models trained at each measured-row budget. `gnn` is much slower than the other listed models.
 - `--strategies`: Phase 1 measurement/acquisition strategies that generate the training rows.
 - `--phase2-optimizers`: Phase 2 optimizers that walk either the trained surrogate landscape or the direct simulator baseline.
 - `--phase2-top-k`: number of optimizer recommendations validated and reported.
@@ -131,8 +131,6 @@ Benchmarks regressors for target-species final biomass and suppressor classifica
 Depends on:
 
 - a summary CSV with `community`, `final_target_biomass`, and optionally `pathogen_signal_std` / `replicate_count`
-- `numpy`, `pandas`, `matplotlib`, `scikit-learn`
-- `torch` only when `--models gnn` is used
 
 Real-world log target:
 
@@ -173,7 +171,6 @@ Generates synthetic interaction tables and runs exhaustive GLV simulations over 
 
 Depends on:
 
-- `numpy`, `pandas`, `matplotlib`, `scipy`
 - optional `interaction_effect_prior.csv` from `simulation_assay_noise.py`
 
 Generate a synthetic interaction table:
@@ -219,7 +216,6 @@ Depends on:
 
 - `GLV_ML/outputs/real_world/log/rw_summary.csv`
 - optionally a simulation summary via `--simulation-summary`
-- `numpy`, `pandas`, `matplotlib`, `scikit-learn`
 
 Fit assay noise and write priors:
 
@@ -256,7 +252,6 @@ Depends on:
 
 - `GLV_ML/outputs/real_world/log/rw_summary.csv`
 - `GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv`
-- `numpy`, `pandas`, `matplotlib`, `scipy`
 
 Run calibration:
 
@@ -290,8 +285,6 @@ Depends on:
 
 - optional real-world summary for assay noise: `GLV_ML/outputs/real_world/log/rw_summary.csv`
 - optional effect priors: `GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv`
-- `numpy`, `pandas`, `matplotlib`, `scipy`, `scikit-learn`
-- `torch` only when `--models gnn` is used
 
 Recommended first full run without Bayesian acquisition:
 
@@ -369,7 +362,6 @@ Replays model-dependent acquisition strategies over a fully materialized summary
 Depends on:
 
 - a materialized summary CSV
-- `numpy`, `pandas`, `matplotlib`, `scipy`, `scikit-learn`
 
 Run model-dependent acquisition strategies:
 
@@ -392,7 +384,6 @@ Replays model-independent search and selection methods over a fully materialized
 Depends on:
 
 - a materialized summary CSV
-- `numpy`, `pandas`, `matplotlib`, `scikit-learn`
 
 Run model-independent baselines:
 
@@ -415,7 +406,6 @@ Depends on:
 
 - `active_learning.py` summary output
 - `selection_baselines.py` summary output
-- `pandas`, `matplotlib`
 
 Run comparison:
 
@@ -434,7 +424,6 @@ Depends on:
 
 - `ml_benchmark.py` output for log target
 - `ml_benchmark.py` output for raw target
-- `pandas`, `matplotlib`
 
 Run comparison:
 
@@ -452,7 +441,6 @@ Runs real-data species-universe scaling-law benchmarks by pretending fewer partn
 Depends on:
 
 - a materialized real-world summary CSV
-- `numpy`, `pandas`, `matplotlib`, `scikit-learn`
 
 Run real-world scaling laws:
 
@@ -472,4 +460,4 @@ Run real-world scaling laws:
 - `--batch-size` controls acquisition batch size in some scripts. It does not automatically set reporting checkpoints unless the script says so; use explicit `--budgets` or `--train-sizes` when you need exact reporting points.
 - `--assay-noise-scale 0` gives deterministic/noiseless observed labels. `--assay-noise-scale 1` uses the fitted assay-noise scale.
 - `target-scale-mapping latent` keeps simulated target biomass on the GLV latent scale. `zscore` maps latent values to the real-world target scale before noise.
-- The GNN model is available as `gnn`, but it is slower and requires PyTorch.
+- The GNN model is available as `gnn`, but it is slower than the other listed models.
