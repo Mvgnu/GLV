@@ -321,7 +321,6 @@ def valid_neighbor_groups(
     group: tuple[str, ...],
     partners: list[str],
     partner_counts: list[int],
-    excluded: set[tuple[str, ...]],
 ) -> list[tuple[str, ...]]:
     valid_sizes = set(partner_counts)
     group_set = set(group)
@@ -329,18 +328,18 @@ def valid_neighbor_groups(
     for partner in partners:
         if partner not in group_set:
             candidate = tuple(sorted((*group, partner)))
-            if len(candidate) in valid_sizes and candidate not in excluded:
+            if len(candidate) in valid_sizes:
                 neighbors.append(candidate)
     for partner in group:
         candidate = tuple(item for item in group if item != partner)
-        if len(candidate) in valid_sizes and candidate not in excluded:
+        if len(candidate) in valid_sizes:
             neighbors.append(candidate)
     for old_partner in group:
         for new_partner in partners:
             if new_partner in group_set:
                 continue
             candidate = tuple(sorted((*(item for item in group if item != old_partner), new_partner)))
-            if len(candidate) in valid_sizes and candidate not in excluded:
+            if len(candidate) in valid_sizes:
                 neighbors.append(candidate)
     return sorted(set(neighbors))
 
@@ -363,13 +362,11 @@ def greedy_forward_explore_groups(
     evaluator,
     rng: np.random.Generator,
     budget: int,
-    excluded: set[tuple[str, ...]],
 ) -> list[tuple[str, ...]]:
     measured: list[tuple[str, ...]] = []
     measured_set: set[tuple[str, ...]] = set()
-    blocked = set(excluded)
     while len(measured) < budget:
-        current = draw_random_partner_groups(partners, partner_counts, rng, 1, blocked | measured_set)
+        current = draw_random_partner_groups(partners, partner_counts, rng, 1, measured_set)
         if not current:
             break
         current_group = current[0]
@@ -380,7 +377,6 @@ def greedy_forward_explore_groups(
                 for partner in partners
                 if partner not in current_group
                 and len(current_group) + 1 in set(partner_counts)
-                and tuple(sorted((*current_group, partner))) not in blocked
             ]
             add_neighbors = [group for group in add_neighbors if group not in measured_set]
             if not add_neighbors:
@@ -390,7 +386,7 @@ def greedy_forward_explore_groups(
             if evaluator.measure(best) >= evaluator.measure(current_group):
                 break
             current_group = best
-    return fill_remaining_explore_groups(measured, measured_set, partners, partner_counts, rng, budget, blocked)
+    return fill_remaining_explore_groups(measured, measured_set, partners, partner_counts, rng, budget, set())
 
 
 def simulated_annealing_explore_groups(
@@ -399,13 +395,11 @@ def simulated_annealing_explore_groups(
     evaluator,
     rng: np.random.Generator,
     budget: int,
-    excluded: set[tuple[str, ...]],
 ) -> list[tuple[str, ...]]:
     measured: list[tuple[str, ...]] = []
     measured_set: set[tuple[str, ...]] = set()
-    blocked = set(excluded)
     while len(measured) < budget:
-        start = draw_random_partner_groups(partners, partner_counts, rng, 1, blocked | measured_set)
+        start = draw_random_partner_groups(partners, partner_counts, rng, 1, measured_set)
         if not start:
             break
         current = start[0]
@@ -414,7 +408,7 @@ def simulated_annealing_explore_groups(
         for _iteration in range(250):
             if len(measured) >= budget:
                 break
-            neighbors = valid_neighbor_groups(current, partners, partner_counts, blocked)
+            neighbors = valid_neighbor_groups(current, partners, partner_counts)
             if not neighbors:
                 break
             proposal = neighbors[int(rng.integers(len(neighbors)))]
@@ -424,7 +418,7 @@ def simulated_annealing_explore_groups(
                 current = proposal
                 current_score = proposal_score
             temperature *= 0.98
-    return fill_remaining_explore_groups(measured, measured_set, partners, partner_counts, rng, budget, blocked)
+    return fill_remaining_explore_groups(measured, measured_set, partners, partner_counts, rng, budget, set())
 
 
 def genetic_algorithm_explore_groups(
@@ -433,12 +427,10 @@ def genetic_algorithm_explore_groups(
     evaluator,
     rng: np.random.Generator,
     budget: int,
-    excluded: set[tuple[str, ...]],
 ) -> list[tuple[str, ...]]:
     measured: list[tuple[str, ...]] = []
     measured_set: set[tuple[str, ...]] = set()
-    blocked = set(excluded)
-    population = draw_random_partner_groups(partners, partner_counts, rng, 24, blocked)
+    population = draw_random_partner_groups(partners, partner_counts, rng, 24, set())
     while len(measured) < budget and population:
         fitness = np.array([evaluate_group(group, evaluator, measured, measured_set) for group in population])
         elite = population[int(np.argmin(fitness))]
@@ -464,13 +456,13 @@ def genetic_algorithm_explore_groups(
                     if needed > 0 and additions:
                         child.extend(rng.choice(additions, size=min(needed, len(additions)), replace=False))
             group = tuple(sorted(child))
-            if group in blocked:
-                replacement = draw_random_partner_groups(partners, partner_counts, rng, 1, blocked | set(offspring))
+            if group in offspring:
+                replacement = draw_random_partner_groups(partners, partner_counts, rng, 1, set(offspring))
                 if replacement:
                     group = replacement[0]
             offspring.append(group)
         population = offspring
-    return fill_remaining_explore_groups(measured, measured_set, partners, partner_counts, rng, budget, blocked)
+    return fill_remaining_explore_groups(measured, measured_set, partners, partner_counts, rng, budget, set())
 
 
 def explore_groups(
@@ -497,11 +489,11 @@ def explore_groups(
             proposal_candidate_size,
         )
     if method == "greedy_forward":
-        return greedy_forward_explore_groups(partners, partner_counts, evaluator, rng, budget, excluded)
+        return greedy_forward_explore_groups(partners, partner_counts, evaluator, rng, budget)
     if method == "simulated_annealing":
-        return simulated_annealing_explore_groups(partners, partner_counts, evaluator, rng, budget, excluded)
+        return simulated_annealing_explore_groups(partners, partner_counts, evaluator, rng, budget)
     if method == "genetic_algorithm":
-        return genetic_algorithm_explore_groups(partners, partner_counts, evaluator, rng, budget, excluded)
+        return genetic_algorithm_explore_groups(partners, partner_counts, evaluator, rng, budget)
     raise ValueError(f"Unknown strategy: {method}")
 
 
@@ -736,7 +728,7 @@ def optimizer_recommendations(
             current = start
             current_score = float(score_groups([current])[0])
             for _step in range(40):
-                neighbors = valid_neighbor_groups(current, partners, partner_counts, set())
+                neighbors = valid_neighbor_groups(current, partners, partner_counts)
                 if not neighbors:
                     break
                 scores = score_groups(neighbors)
@@ -761,7 +753,7 @@ def optimizer_recommendations(
             current_score = float(score_groups([current])[0])
             temperature = 0.5
             for _step in range(120):
-                neighbors = valid_neighbor_groups(current, partners, partner_counts, set())
+                neighbors = valid_neighbor_groups(current, partners, partner_counts)
                 if not neighbors:
                     break
                 proposal = neighbors[int(rng.integers(len(neighbors)))]
