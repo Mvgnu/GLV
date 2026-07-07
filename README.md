@@ -1,0 +1,475 @@
+# GLV ML
+
+Tools for generating generalized Lotka-Volterra (GLV) community landscapes, preparing real-world target-biomass data, benchmarking surrogate models, and testing model-guided landscape search.
+
+The examples below assume the existing project virtualenv:
+
+```bash
+.venv/bin/python ...
+```
+
+## Workflow
+
+1. Prepare real-world summaries:
+
+```bash
+.venv/bin/python GLV_ML/rw_prepare.py \
+  --input-dir GLV_ML/rw_data \
+  --output-dir GLV_ML/outputs/real_world/log \
+  --target-transform log1p
+```
+
+Alternatively '--target-transform raw' to skip log transformation.
+
+2. Fit assay-noise/effect priors from real data:
+
+```bash
+.venv/bin/python GLV_ML/simulation_assay_noise.py \
+  --rw-summary GLV_ML/outputs/real_world/log/rw_summary.csv \
+  --output-dir GLV_ML/outputs/calibration/assay_noise
+```
+
+Used as a reference for fitting interaction-effect priors that mimic real-world assay-noise structure for the simulation. 
+
+3. Run simulated landscape scaling:
+
+```bash
+.venv/bin/python GLV_ML/simulated_landscape_scaling.py \
+  --species-counts 12,16,20,24,28 \
+  --partner-counts 3-18 \
+  --partner-count-bands small:3-5,medium:6-10,large:11-15,very_large:16-18 \
+  --proposal-candidate-size 2000 \
+  --audit-size 5000 \
+  --audit-fraction 0.25 \
+  --budgets 100,200,300,400,500,600,700,800,900,1000,1100,1200,1300,1400,1500,1600,1700,1800,1900,2000 \
+  --batch-size 100 \
+  --seeds 3 \
+  --models ridge_pairwise,random_forest,hist_gradient_boosting,gnn \
+  --strategies random,size_balanced,max_diversity \
+  --phase2-optimizers predicted_best,greedy_forward,simulated_annealing,genetic_algorithm \
+  --phase2-top-k 5 \
+  --interaction-generator hierarchical \
+  --carrying-capacity-min 0.5 \
+  --carrying-capacity-max 2.0 \
+  --hierarchy-strength 0.15 \
+  --hierarchy-noise 0.02 \
+  --interaction-response saturating \
+  --saturation-pressure 1.0 \
+  --target-interaction-scale 1 \
+  --target-scale-mapping latent \
+  --assay-noise-scale 1 \
+  --output-dir GLV_ML/outputs/benchmarks/scaling_laws_simulated_phase2_hierarchical_saturating_latent_noise
+```
+
+Parameter notes:
+
+- `--species-counts`: species-pool sizes to test. The target species is included in each pool.
+- `--partner-counts`: number of non-target partners in each community. Total community size is `partner_count + 1` because the target is always present.
+- `--partner-count-bands`: reporting bands used to evaluate whether model performance changes across small, medium, and large communities within the same species pool.
+- `--proposal-candidate-size`: number of candidate communities sampled when a strategy or Phase 2 optimizer needs a candidate pool. It is not a per-community-size limit.
+- `--audit-size`: maximum number of hidden audit communities used to evaluate trained models.
+- `--audit-fraction`: caps audit rows as a fraction of the finite combinatorial space, mainly to avoid oversized audit pools for smaller species counts.
+- `--budgets`: measured-row checkpoints used to train/evaluate models and estimate how many measurements are needed.
+- `--batch-size`: acquisition batch size for Bayesian optimization. It does not control the reporting checkpoints when `--budgets` is explicit.
+- `--seeds`: number of independent landscape/acquisition repeats.
+- `--models`: surrogate models trained at each measured-row budget. `gnn` requires PyTorch and is much slower than the sklearn models.
+- `--strategies`: Phase 1 measurement/acquisition strategies that generate the training rows.
+- `--phase2-optimizers`: Phase 2 optimizers that walk either the trained surrogate landscape or the direct simulator baseline.
+- `--phase2-top-k`: number of optimizer recommendations validated and reported.
+- `--interaction-generator`: generator used to create the GLV interaction table. `hierarchical` adds trait-like dominant species structure.
+- `--carrying-capacity-min` / `--carrying-capacity-max`: range used to set species self-interaction strengths in the hierarchical generator.
+- `--hierarchy-strength`: strength of species-level hierarchy effects in generated interactions.
+- `--hierarchy-noise`: noise around the hierarchy effects.
+- `--interaction-response`: GLV response form. `saturating` bounds accumulated off-diagonal pressure.
+- `--saturation-pressure`: pressure scale where saturating interactions begin to plateau.
+- `--target-interaction-scale`: multiplier for target-row interactions; useful as a diagnostic target-effect rescaling knob.
+- `--target-scale-mapping`: output mapping for target biomass. `latent` keeps GLV latent biomass; `zscore` maps to the real-world target scale before noise.
+- `--assay-noise-scale`: multiplier for fitted assay noise. Use `0` for deterministic labels and `1` for calibrated lab-like noise.
+- `--output-dir`: output directory for run metadata, sampled pools, metrics, summaries, and plots.
+
+
+## Script Reference
+
+### `rw_prepare.py`
+
+Prepares real-world community measurements into one ML-ready summary table and plots diagnostics.
+
+Default input path is `GLV_ML/rw_data`.
+
+Log-transformed pathogen signal:
+
+```bash
+.venv/bin/python GLV_ML/rw_prepare.py \
+  --input-dir GLV_ML/rw_data \
+  --output-dir GLV_ML/outputs/real_world/log \
+  --species-prefix sp \
+  --target-species pathogen \
+  --target-transform log1p
+```
+
+Raw pathogen signal:
+
+```bash
+.venv/bin/python GLV_ML/rw_prepare.py \
+  --input-dir GLV_ML/rw_data \
+  --output-dir GLV_ML/outputs/real_world/raw \
+  --species-prefix sp \
+  --target-species pathogen \
+  --target-transform raw
+```
+
+Main output:
+
+```text
+GLV_ML/outputs/real_world/<log|raw>/rw_summary.csv
+```
+
+### `ml_benchmark.py`
+
+Benchmarks regressors for target-species final biomass and suppressor classification.
+
+Depends on:
+
+- a summary CSV with `community`, `final_target_biomass`, and optionally `pathogen_signal_std` / `replicate_count`
+- `numpy`, `pandas`, `matplotlib`, `scikit-learn`
+- `torch` only when `--models gnn` is used
+
+Real-world log target:
+
+```bash
+.venv/bin/python GLV_ML/ml_benchmark.py \
+  GLV_ML/outputs/real_world/log/rw_summary.csv \
+  --output-dir GLV_ML/outputs/benchmarks/ml/rw_log \
+  --target-species pathogen \
+  --models ridge_main,ridge_pairwise,random_forest,hist_gradient_boosting \
+  --suppressor-target-scale log
+```
+
+Real-world raw target:
+
+```bash
+.venv/bin/python GLV_ML/ml_benchmark.py \
+  GLV_ML/outputs/real_world/raw/rw_summary.csv \
+  --output-dir GLV_ML/outputs/benchmarks/ml/rw_raw \
+  --target-species pathogen \
+  --models ridge_main,ridge_pairwise,random_forest,hist_gradient_boosting \
+  --suppressor-target-scale raw
+```
+
+Simulated target:
+
+```bash
+.venv/bin/python GLV_ML/ml_benchmark.py \
+  GLV_ML/outputs/simulation/exhaustive/all_summary_stats.csv \
+  --output-dir GLV_ML/outputs/benchmarks/ml/simulated \
+  --target-species sp_012 \
+  --species-ids sp_001,sp_002,sp_003,sp_004,sp_005,sp_006,sp_007,sp_008,sp_009,sp_010,sp_011,sp_012 \
+  --models ridge_main,ridge_pairwise,random_forest,hist_gradient_boosting
+```
+
+### `lotka_volterra.py`
+
+Generates synthetic interaction tables and runs exhaustive GLV simulations over species combinations.
+
+Depends on:
+
+- `numpy`, `pandas`, `matplotlib`, `scipy`
+- optional `interaction_effect_prior.csv` from `simulation_assay_noise.py`
+
+Generate a synthetic interaction table:
+
+```bash
+.venv/bin/python GLV_ML/lotka_volterra.py \
+  --generate-csv GLV_ML/outputs/inputs/generated_12_species.csv \
+  --species-count 12 \
+  --target-species sp_012 \
+  --interaction-generator hierarchical \
+  --carrying-capacity-min 0.5 \
+  --carrying-capacity-max 2.0 \
+  --hierarchy-strength 0.15 \
+  --hierarchy-noise 0.02 \
+  --off-diagonal-min -0.5 \
+  --off-diagonal-max 0.2 \
+  --self-interaction -1.0 \
+  --target-self-interaction -1.0 \
+  --seed 42
+```
+
+Simulate all target-containing communities with 3 to 11 partners:
+
+```bash
+.venv/bin/python GLV_ML/lotka_volterra.py \
+  GLV_ML/outputs/inputs/generated_12_species.csv \
+  --target-species sp_012 \
+  --min-community-size 3 \
+  --max-community-size 11 \
+  --initial-density 0.5 \
+  --max-time 2000 \
+  --time-step 0.1 \
+  --output-dir GLV_ML/outputs/simulation/exhaustive
+```
+
+Use `--skip-community-plots` for faster non-visual runs.
+
+### `simulation_assay_noise.py`
+
+Fits real-world assay-noise structure and derives interaction-effect priors from a real-world summary. Optionally applies the fitted noise model to an existing simulation summary.
+
+Depends on:
+
+- `GLV_ML/outputs/real_world/log/rw_summary.csv`
+- optionally a simulation summary via `--simulation-summary`
+- `numpy`, `pandas`, `matplotlib`, `scikit-learn`
+
+Fit assay noise and write priors:
+
+```bash
+.venv/bin/python GLV_ML/simulation_assay_noise.py \
+  --rw-summary GLV_ML/outputs/real_world/log/rw_summary.csv \
+  --output-dir GLV_ML/outputs/calibration/assay_noise \
+  --target-species pathogen
+```
+
+Apply fitted noise to a simulation summary:
+
+```bash
+.venv/bin/python GLV_ML/simulation_assay_noise.py \
+  --rw-summary GLV_ML/outputs/real_world/log/rw_summary.csv \
+  --simulation-summary GLV_ML/outputs/simulation/exhaustive/all_summary_stats.csv \
+  --output-dir GLV_ML/outputs/calibration/assay_noise \
+  --target-species pathogen \
+  --simulation-target-species sp_012 \
+  --species-ids sp_001,sp_002,sp_003,sp_004,sp_005,sp_006,sp_007,sp_008,sp_009,sp_010,sp_011,sp_012
+```
+
+Main output:
+
+```text
+GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv
+```
+
+### `calibrate_simulation_rates.py`
+
+Sweeps GLV effect-scale parameters and compares simulated suppressor rates against real-world suppressor rates.
+
+Depends on:
+
+- `GLV_ML/outputs/real_world/log/rw_summary.csv`
+- `GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv`
+- `numpy`, `pandas`, `matplotlib`, `scipy`
+
+Run calibration:
+
+```bash
+.venv/bin/python GLV_ML/calibrate_simulation_rates.py \
+  --rw-summary GLV_ML/outputs/real_world/log/rw_summary.csv \
+  --effect-prior-csv GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv \
+  --output-dir GLV_ML/outputs/calibration/suppressor_rates \
+  --species-count 12 \
+  --target-species sp_012 \
+  --interaction-response saturating \
+  --saturation-pressure 1.0 \
+  --endpoint-initial-density 0.5 \
+  --endpoint-max-time 500 \
+  --seed 42
+```
+
+Main outputs:
+
+```text
+GLV_ML/outputs/calibration/suppressor_rates/best_calibrated_interactions.csv
+GLV_ML/outputs/calibration/suppressor_rates/best_calibrated_summary.csv
+GLV_ML/outputs/calibration/suppressor_rates/suppressor_rate_calibration.csv
+```
+
+### `simulated_landscape_scaling.py`
+
+Generates sampled simulated landscapes, trains surrogates at increasing measurement budgets, evaluates audit performance, and runs Phase 2 optimizer walks over surrogate and direct simulator landscapes.
+
+Depends on:
+
+- optional real-world summary for assay noise: `GLV_ML/outputs/real_world/log/rw_summary.csv`
+- optional effect priors: `GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv`
+- `numpy`, `pandas`, `matplotlib`, `scipy`, `scikit-learn`
+- `torch` only when `--models gnn` is used
+
+Recommended first full run without Bayesian acquisition:
+
+```bash
+.venv/bin/python GLV_ML/simulated_landscape_scaling.py \
+  --species-counts 12,16,20,24,28 \
+  --partner-counts 3-18 \
+  --partner-count-bands small:3-5,medium:6-10,large:11-15,very_large:16-18 \
+  --proposal-candidate-size 2000 \
+  --audit-size 5000 \
+  --audit-fraction 0.25 \
+  --budgets 100,200,300,400,500,600,700,800,900,1000,1100,1200,1300,1400,1500,1600,1700,1800,1900,2000 \
+  --batch-size 100 \
+  --seeds 3 \
+  --models ridge_pairwise,random_forest,hist_gradient_boosting \
+  --strategies random,size_balanced,max_diversity \
+  --phase2-optimizers predicted_best,greedy_forward,simulated_annealing,genetic_algorithm \
+  --phase2-top-k 5 \
+  --interaction-generator hierarchical \
+  --carrying-capacity-min 0.5 \
+  --carrying-capacity-max 2.0 \
+  --hierarchy-strength 0.15 \
+  --hierarchy-noise 0.02 \
+  --interaction-response saturating \
+  --saturation-pressure 1.0 \
+  --target-interaction-scale 1 \
+  --target-scale-mapping latent \
+  --assay-noise-scale 1 \
+  --output-dir GLV_ML/outputs/benchmarks/scaling_laws_simulated_phase2_hierarchical_saturating_latent_noise
+```
+
+Noiseless diagnostic run:
+
+```bash
+.venv/bin/python GLV_ML/simulated_landscape_scaling.py \
+  --species-counts 12,16,20,24,28 \
+  --partner-counts 3-18 \
+  --partner-count-bands small:3-5,medium:6-10,large:11-15,very_large:16-18 \
+  --proposal-candidate-size 2000 \
+  --audit-size 5000 \
+  --audit-fraction 0.25 \
+  --budgets 100,200,300,400,500,600,700,800,900,1000,1100,1200,1300,1400,1500,1600,1700,1800,1900,2000 \
+  --batch-size 100 \
+  --seeds 3 \
+  --models ridge_pairwise,random_forest,hist_gradient_boosting \
+  --strategies random,size_balanced,max_diversity \
+  --phase2-optimizers predicted_best,greedy_forward,simulated_annealing,genetic_algorithm \
+  --phase2-top-k 5 \
+  --interaction-generator hierarchical \
+  --carrying-capacity-min 0.5 \
+  --carrying-capacity-max 2.0 \
+  --hierarchy-strength 0.15 \
+  --hierarchy-noise 0.02 \
+  --interaction-response saturating \
+  --saturation-pressure 1.0 \
+  --target-interaction-scale 1 \
+  --target-scale-mapping latent \
+  --assay-noise-scale 0 \
+  --output-dir GLV_ML/outputs/benchmarks/scaling_laws_simulated_phase2_hierarchical_saturating_latent_nonoise
+```
+
+Main outputs:
+
+```text
+simulated_scaling_metrics.csv
+simulated_scaling_summary.csv
+phase2_optimizer_metrics.csv
+phase2_optimizer_summary.csv
+```
+
+### `active_learning.py`
+
+Replays model-dependent acquisition strategies over a fully materialized summary table. Use this for active-learning comparisons where the full oracle table already exists.
+
+Depends on:
+
+- a materialized summary CSV
+- `numpy`, `pandas`, `matplotlib`, `scipy`, `scikit-learn`
+
+Run model-dependent acquisition strategies:
+
+```bash
+.venv/bin/python GLV_ML/active_learning.py \
+  GLV_ML/outputs/real_world/log/rw_summary.csv \
+  --output-dir GLV_ML/outputs/benchmarks/active_learning/rw_log \
+  --target-species pathogen \
+  --models ridge_pairwise,random_forest,hist_gradient_boosting \
+  --strategies predicted_best,diverse_predicted_best,size_balanced_predicted_best,ensemble_uncertainty,bayesian_optimization \
+  --initial-size 50 \
+  --batch-size 25 \
+  --seeds 5
+```
+
+### `selection_baselines.py`
+
+Replays model-independent search and selection methods over a fully materialized summary table. Models are trained only to evaluate downstream landscape learning, not to select rows.
+
+Depends on:
+
+- a materialized summary CSV
+- `numpy`, `pandas`, `matplotlib`, `scikit-learn`
+
+Run model-independent baselines:
+
+```bash
+.venv/bin/python GLV_ML/selection_baselines.py \
+  GLV_ML/outputs/real_world/log/rw_summary.csv \
+  --output-dir GLV_ML/outputs/benchmarks/selection_baselines/rw_log \
+  --target-species pathogen \
+  --models ridge_pairwise,random_forest,hist_gradient_boosting \
+  --methods random,greedy_forward,simulated_annealing,genetic_algorithm,max_diversity,size_balanced \
+  --batch-size 25 \
+  --seeds 5
+```
+
+### `compare_selection_runs.py`
+
+Compares active-learning and selection-baseline summaries.
+
+Depends on:
+
+- `active_learning.py` summary output
+- `selection_baselines.py` summary output
+- `pandas`, `matplotlib`
+
+Run comparison:
+
+```bash
+.venv/bin/python GLV_ML/compare_selection_runs.py \
+  --active-summary GLV_ML/outputs/benchmarks/active_learning/rw_log/active_learning_summary.csv \
+  --selection-summary GLV_ML/outputs/benchmarks/selection_baselines/rw_log/selection_baseline_summary.csv \
+  --output-dir GLV_ML/outputs/benchmarks/selection_comparison/rw_log
+```
+
+### `compare_target_transforms.py`
+
+Compares raw versus log target benchmark reports.
+
+Depends on:
+
+- `ml_benchmark.py` output for log target
+- `ml_benchmark.py` output for raw target
+- `pandas`, `matplotlib`
+
+Run comparison:
+
+```bash
+.venv/bin/python GLV_ML/compare_target_transforms.py \
+  --log-report-dir GLV_ML/outputs/benchmarks/ml/rw_log \
+  --raw-report-dir GLV_ML/outputs/benchmarks/ml/rw_raw \
+  --output-dir GLV_ML/outputs/real_world/comparisons/target_transform
+```
+
+### `scaling_laws.py`
+
+Runs real-data species-universe scaling-law benchmarks by pretending fewer partner species are available.
+
+Depends on:
+
+- a materialized real-world summary CSV
+- `numpy`, `pandas`, `matplotlib`, `scikit-learn`
+
+Run real-world scaling laws:
+
+```bash
+.venv/bin/python GLV_ML/scaling_laws.py \
+  GLV_ML/outputs/real_world/log/rw_summary.csv \
+  --output-dir GLV_ML/outputs/benchmarks/scaling_laws_real/log \
+  --target-species pathogen \
+  --species-counts 3,4,5,6,7,8,9,10,11 \
+  --universes-per-size 5 \
+  --train-fractions 0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40 \
+  --models ridge_pairwise,random_forest,hist_gradient_boosting
+```
+
+## Notes
+
+- `--batch-size` controls acquisition batch size in some scripts. It does not automatically set reporting checkpoints unless the script says so; use explicit `--budgets` or `--train-sizes` when you need exact reporting points.
+- `--assay-noise-scale 0` gives deterministic/noiseless observed labels. `--assay-noise-scale 1` uses the fitted assay-noise scale.
+- `target-scale-mapping latent` keeps simulated target biomass on the GLV latent scale. `zscore` maps latent values to the real-world target scale before noise.
+- The GNN model is available as `gnn`, but it is slower and requires PyTorch.
