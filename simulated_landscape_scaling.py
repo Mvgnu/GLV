@@ -96,25 +96,22 @@ def sample_partner_groups(
 
     for partner_count, requested_rows in sorted(rows_by_partner_count.items()):
         possible_count = math.comb(len(partners), partner_count)
-        requested_count = min(requested_rows, possible_count - sum(
-            1
-            for group in seen
-            if len(group) == partner_count and set(group).issubset(partners)
-        ))
-        if requested_count <= 0:
+        seen_at_size = sum(1 for group in seen if len(group) == partner_count)
+        take = min(requested_rows, possible_count - seen_at_size)
+        if take <= 0:
             continue
 
-        if possible_count <= requested_count * 4:
-            candidates = list(itertools.combinations(partners, partner_count))
-            candidates = [candidate for candidate in candidates if candidate not in seen]
+        if possible_count - seen_at_size <= take * 4:
+            candidates = [
+                candidate
+                for candidate in itertools.combinations(partners, partner_count)
+                if candidate not in seen
+            ]
             rng.shuffle(candidates)
-            selected = candidates[:requested_count]
+            selected = candidates[:take]
         else:
             selected = []
-            attempts = 0
-            max_attempts = requested_count * 100
-            while len(selected) < requested_count and attempts < max_attempts:
-                attempts += 1
+            while len(selected) < take:
                 candidate = tuple(sorted(rng.choice(partners, size=partner_count, replace=False)))
                 if candidate in seen:
                     continue
@@ -122,8 +119,7 @@ def sample_partner_groups(
                 seen.add(candidate)
 
         for group in selected:
-            if group not in seen:
-                seen.add(group)
+            seen.add(group)
             groups.append(group)
 
     return groups
