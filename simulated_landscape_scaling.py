@@ -113,10 +113,12 @@ def sample_partner_groups(
             selected = candidates[:take]
         else:
             selected = []
+            selected_seen = set()
             while len(selected) < take:
                 candidate = tuple(sorted(rng.choice(partners, size=partner_count, replace=False)))
-                if candidate in seen:
+                if candidate in seen or candidate in selected_seen:
                     continue
+                selected_seen.add(candidate)
                 selected.append(candidate)
 
         for group in selected:
@@ -220,19 +222,25 @@ def draw_random_partner_groups(
     count: int,
     excluded: set[tuple[str, ...]],
 ) -> list[tuple[str, ...]]:
-    groups = []
     seen = set(excluded)
-    attempts = 0
-    max_attempts = max(count * 200, 1000)
-    while len(groups) < count and attempts < max_attempts:
-        attempts += 1
-        partner_count = int(rng.choice(partner_counts))
-        group = tuple(sorted(rng.choice(partners, size=partner_count, replace=False)))
-        if group in seen:
-            continue
-        seen.add(group)
-        groups.append(group)
-    return groups
+    rows_by_partner_count = {partner_count: 0 for partner_count in partner_counts}
+    available_by_partner_count = {
+        partner_count: (
+            math.comb(len(partners), partner_count)
+            - sum(1 for group in seen if len(group) == partner_count)
+        )
+        for partner_count in partner_counts
+    }
+    take = min(count, sum(available_by_partner_count.values()))
+    while sum(rows_by_partner_count.values()) < take:
+        available_counts = [
+            partner_count
+            for partner_count, available in available_by_partner_count.items()
+            if rows_by_partner_count[partner_count] < available
+        ]
+        partner_count = int(rng.choice(available_counts))
+        rows_by_partner_count[partner_count] += 1
+    return sample_partner_groups(partners, rows_by_partner_count, rng, excluded)
 
 
 def fill_remaining_explore_groups(
@@ -269,16 +277,12 @@ def size_balanced_explore_groups(
     while len(groups) < budget:
         progressed = False
         for partner_count in partner_counts:
-            attempts = 0
-            while attempts < 200:
-                attempts += 1
-                group = tuple(sorted(rng.choice(partners, size=partner_count, replace=False)))
-                if group in seen:
-                    continue
+            selected = sample_partner_groups(partners, {partner_count: 1}, rng, seen)
+            if selected:
+                group = selected[0]
                 seen.add(group)
                 groups.append(group)
                 progressed = True
-                break
             if len(groups) >= budget:
                 break
         if not progressed:
