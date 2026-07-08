@@ -236,28 +236,6 @@ def presence_from_groups(
     return presence
 
 
-def fill_remaining_explore_groups(
-    measured: list[tuple[str, ...]],
-    measured_set: set[tuple[str, ...]],
-    partners: list[str],
-    partner_counts: list[int],
-    rng: np.random.Generator,
-    budget: int,
-    excluded: set[tuple[str, ...]],
-) -> list[tuple[str, ...]]:
-    if len(measured) >= budget:
-        return measured[:budget]
-    remaining = sample_partner_groups(
-        partners,
-        partner_counts,
-        rng,
-        set(excluded) | measured_set,
-        count=budget - len(measured),
-    )
-    measured.extend(remaining)
-    return measured[:budget]
-
-
 def size_balanced_explore_groups(
     partners: list[str],
     partner_counts: list[int],
@@ -544,15 +522,17 @@ def bayesian_iterative_groups(
             measured_groups.append(group)
             measured_set.add(group)
 
-    return fill_remaining_explore_groups(
-        measured_groups,
-        measured_set,
-        partners,
-        partner_counts,
-        rng,
-        budget,
-        blocked,
-    )
+    if len(measured_groups) < budget:
+        measured_groups.extend(
+            sample_partner_groups(
+                partners,
+                partner_counts,
+                rng,
+                blocked | measured_set,
+                count=budget - len(measured_groups),
+            )
+        )
+    return measured_groups[:budget]
 
 
 def features_for_partner_groups(
