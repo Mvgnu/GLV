@@ -253,6 +253,47 @@ def glv_derivatives(_time, densities, growth_rates, interaction_matrix):
     return densities * (growth_rates + interaction_matrix @ densities)
 
 
+def saturated_interaction_response(densities, interaction_matrix, saturation_pressure):
+    """Bound total off-diagonal pressure while retaining signed interaction effects."""
+    off_diagonal = np.array(interaction_matrix, dtype=float).copy()
+    np.fill_diagonal(off_diagonal, 0.0)
+    raw_pressure = off_diagonal @ densities
+    return saturation_pressure * np.tanh(raw_pressure / saturation_pressure)
+
+
+def saturating_derivatives(_time, densities, growth_rates, interaction_matrix, saturation_pressure):
+    """Return GLV derivatives with bounded off-diagonal interaction pressure."""
+    densities = np.maximum(np.asarray(densities, dtype=float), 0.0)
+    self_pressure = np.diag(interaction_matrix) * densities
+    interaction_pressure = saturated_interaction_response(
+        densities,
+        interaction_matrix,
+        saturation_pressure,
+    )
+    return densities * (growth_rates + self_pressure + interaction_pressure)
+
+
+def saturating_endpoint(
+    growth_rates,
+    interaction_matrix,
+    initial_density,
+    max_time,
+    saturation_pressure,
+):
+    """Integrate saturating GLV dynamics and return the terminal density vector."""
+    initial = np.full(len(growth_rates), initial_density, dtype=float)
+    solution = solve_ivp(
+        saturating_derivatives,
+        t_span=(0.0, max_time),
+        y0=initial,
+        args=(growth_rates, interaction_matrix, saturation_pressure),
+        method="RK45",
+        rtol=1e-6,
+        atol=1e-9,
+    )
+    return np.maximum(solution.y[:, -1], 0.0)
+
+
 def load_community_data(csv_path):
     """Load species ids, growth rates, and interactions from a square CSV."""
     data = pd.read_csv(csv_path)

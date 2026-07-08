@@ -80,7 +80,7 @@ Parameter notes:
 - `--carrying-capacity-min` / `--carrying-capacity-max`: range used to set species self-interaction strengths in the hierarchical generator.
 - `--hierarchy-strength`: strength of species-level hierarchy effects in generated interactions.
 - `--hierarchy-noise`: noise around the hierarchy effects.
-- `--interaction-response`: GLV response form. `saturating` bounds accumulated off-diagonal pressure.
+- `--interaction-response`: simulated landscape scaling accepts `saturating`; off-diagonal pressure is bounded inside the integrated GLV equations.
 - `--saturation-pressure`: pressure scale where saturating interactions begin to plateau.
 - `--target-interaction-scale`: multiplier for target-row interactions; useful as a diagnostic target-effect rescaling knob.
 - `--target-scale-mapping`: output mapping for target biomass. `latent` keeps GLV latent biomass; `zscore` maps to the real-world target scale before noise.
@@ -247,6 +247,8 @@ GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv
 ### `calibrate_simulation_rates.py`
 
 Sweeps GLV effect-scale parameters and compares simulated suppressor rates against real-world suppressor rates.
+
+Calibration can use `--interaction-response linear` as a fast coexistence-equilibrium shortcut for tuning sweeps. Simulated landscape scaling uses the integrated saturating endpoint instead.
 
 Depends on:
 

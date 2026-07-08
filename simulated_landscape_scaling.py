@@ -18,12 +18,11 @@ import pandas as pd
 
 from calibrate_simulation_rates import (
     add_assay_observations,
-    terminal_endpoint,
 )
 from active_learning import (
     train_model as train_active_model,
 )
-from lotka_volterra import generate_interaction_data
+from lotka_volterra import generate_interaction_data, saturating_endpoint
 from ml_benchmark import (
     GLVIdentityGNNRegressor,
     add_pairwise_features,
@@ -61,6 +60,7 @@ def parse_partner_counts(value: str) -> list[int]:
         item = raw_item.strip()
         if not item:
             continue
+        # for ranges
         if "-" in item:
             start, end = item.split("-", maxsplit=1)
             counts.update(range(int(start), int(end) + 1))
@@ -90,6 +90,7 @@ def sample_partner_groups(
     rng: np.random.Generator,
     excluded: set[tuple[str, ...]] | None = None,
 ) -> list[tuple[str, ...]]:
+    # exclude audit set communities to avoid test/train overlap for model training/sampling, empty for exploration/phase 2
     excluded = excluded or set()
     groups: list[tuple[str, ...]] = []
     seen = set(excluded)
@@ -101,6 +102,7 @@ def sample_partner_groups(
         if take <= 0:
             continue
 
+        # if we need at least 25% of the remaining space, just enumerate otherwise sample randomly
         if possible_count - seen_at_size <= take * 4:
             candidates = [
                 candidate
@@ -116,7 +118,6 @@ def sample_partner_groups(
                 if candidate in seen:
                     continue
                 selected.append(candidate)
-                seen.add(candidate)
 
         for group in selected:
             seen.add(group)
@@ -145,16 +146,17 @@ def simulate_communities(
     for community in communities:
         indices = [index_by_species[species] for species in community]
         local_target_index = list(community).index(target_species)
-        final = terminal_endpoint(
+        if interaction_response != "saturating":
+            raise ValueError("landscape scaling requires --interaction-response saturating")
+        final = saturating_endpoint(
             growth_rates[indices],
             interaction_matrix[np.ix_(indices, indices)],
-            local_target_index,
-            extinction_threshold,
-            interaction_response,
-            saturation_pressure,
             endpoint_initial_density,
             endpoint_max_time,
+            saturation_pressure,
         )
+        # Treat numerically tiny terminal densities as extinct after integration.
+        final[final < extinction_threshold] = 0.0
         rows.append({
             "community": ";".join(community),
             "community_size": len(community),
@@ -1944,8 +1946,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-interaction-scale", type=float, default=1.0)
     parser.add_argument(
         "--interaction-response",
-        choices=["linear", "saturating"],
-        default="linear",
+        choices=["saturating"],
+        default="saturating",
     )
     parser.add_argument("--saturation-pressure", type=float, default=1.0)
     parser.add_argument("--endpoint-initial-density", type=float, default=0.5)

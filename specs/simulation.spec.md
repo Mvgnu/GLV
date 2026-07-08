@@ -51,11 +51,11 @@ the target species in the interaction table itself, which is the core simulator 
 for avoiding trivial landscapes where many communities drive the target to exact
 extinction.
 
-Fast endpoint consumers may choose an interaction response mode. `linear` uses the GLV
-coexistence-equilibrium approximation. `saturating` integrates a bounded-interaction
-system where each species receives a signed, row-total off-diagonal pressure passed
-through `saturation_pressure * tanh(raw_pressure / saturation_pressure)`. This applies to
-all species, not only the target, and is intended to create graded suppressor landscapes
+Calibration sweeps may use `linear` as a fast GLV coexistence-equilibrium approximation.
+Production simulated-landscape runs use the integrated `saturating` endpoint, where each
+species receives a signed, row-total off-diagonal pressure passed through
+`saturation_pressure * tanh(raw_pressure / saturation_pressure)`. This applies to all
+species, not only the target, and is intended to create graded suppressor landscapes
 without arbitrary target-only rescue terms.
 
 Generated GLV inputs may also use empirical target-effect priors from

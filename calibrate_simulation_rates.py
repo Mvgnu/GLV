@@ -11,9 +11,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.integrate import solve_ivp
 
-from lotka_volterra import generate_interaction_data
+from lotka_volterra import generate_interaction_data, saturating_endpoint
 from simulation_assay_noise import fit_assay_noise_model, sample_assay_sd
 
 
@@ -103,57 +102,7 @@ def survivor_equilibrium(
     return final
 
 
-def saturated_interaction_response(
-    densities: np.ndarray,
-    interaction_matrix: np.ndarray,
-    saturation_pressure: float,
-) -> np.ndarray:
-    """Bound total off-diagonal pressure while retaining signed interaction effects."""
-    off_diagonal = interaction_matrix.copy()
-    np.fill_diagonal(off_diagonal, 0.0)
-    raw_pressure = off_diagonal @ densities
-    return saturation_pressure * np.tanh(raw_pressure / saturation_pressure)
-
-
-def saturating_derivatives(
-    _time: float,
-    densities: np.ndarray,
-    growth_rates: np.ndarray,
-    interaction_matrix: np.ndarray,
-    saturation_pressure: float,
-) -> np.ndarray:
-    densities = np.maximum(densities, 0.0)
-    self_pressure = np.diag(interaction_matrix) * densities
-    interaction_pressure = saturated_interaction_response(
-        densities,
-        interaction_matrix,
-        saturation_pressure,
-    )
-    return densities * (growth_rates + self_pressure + interaction_pressure)
-
-
-def saturating_endpoint(
-    growth_rates: np.ndarray,
-    interaction_matrix: np.ndarray,
-    initial_density: float,
-    max_time: float,
-    saturation_pressure: float,
-) -> np.ndarray:
-    """Integrate the bounded-interaction system to a terminal endpoint."""
-    initial = np.full(len(growth_rates), initial_density, dtype=float)
-    solution = solve_ivp(
-        saturating_derivatives,
-        t_span=(0.0, max_time),
-        y0=initial,
-        args=(growth_rates, interaction_matrix, saturation_pressure),
-        method="RK45",
-        rtol=1e-6,
-        atol=1e-9,
-    )
-    return np.maximum(solution.y[:, -1], 0.0)
-
-
-def terminal_endpoint(
+def calibration_endpoint(
     growth_rates: np.ndarray,
     interaction_matrix: np.ndarray,
     target_index: int,
@@ -204,7 +153,7 @@ def endpoint_summary(
             community = tuple(sorted((*partner_group, target_species)))
             indices = [index_by_species[species] for species in community]
             local_target_index = community.index(target_species)
-            final = terminal_endpoint(
+            final = calibration_endpoint(
                 growth_rates[indices],
                 interaction_matrix[np.ix_(indices, indices)],
                 local_target_index,
