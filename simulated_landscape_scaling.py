@@ -95,6 +95,8 @@ def sample_partner_groups(
     excluded = excluded or set()
     groups: list[tuple[str, ...]] = []
     seen = set(excluded)
+    # Dict path: exact rows per partner count. List path: count total rows randomly
+    # spread across allowed partner counts, capped by the remaining possible groups.
     if isinstance(partner_count_request, dict):
         rows_by_partner_count = partner_count_request
     else:
@@ -727,6 +729,7 @@ def optimizer_recommendations(
     if optimizer == "predicted_best":
         score_groups(candidates)
     elif optimizer == "greedy_forward":
+        # All neighbors are evaluated at each move; caps only bound starts and walk length.
         starts = sample_partner_groups(
             partners,
             partner_counts,
@@ -751,6 +754,7 @@ def optimizer_recommendations(
                 current = neighbors[best_index]
                 current_score = best_score
     elif optimizer == "simulated_annealing":
+        # The neighbor set is complete; annealing samples one neighbor per bounded step.
         starts = sample_partner_groups(
             partners,
             partner_counts,
@@ -776,6 +780,7 @@ def optimizer_recommendations(
                     current_score = proposal_score
                 temperature *= 0.98
     elif optimizer == "genetic_algorithm":
+        # Population and generation counts cap compute, not the per-community neighbor set.
         population = sample_partner_groups(partners, partner_counts, rng, set(), count=48)
         candidates.extend(population)
         for _generation in range(60):
