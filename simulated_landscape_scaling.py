@@ -86,14 +86,35 @@ def parse_partner_count_bands(value: str) -> list[PartnerCountBand]:
 
 def sample_partner_groups(
     partners: list[str],
-    rows_by_partner_count: dict[int, int],
+    partner_count_request: dict[int, int] | list[int],
     rng: np.random.Generator,
     excluded: set[tuple[str, ...]] | None = None,
+    count: int | None = None,
 ) -> list[tuple[str, ...]]:
     # exclude audit set communities to avoid test/train overlap for model training/sampling, empty for exploration/phase 2
     excluded = excluded or set()
     groups: list[tuple[str, ...]] = []
     seen = set(excluded)
+    if isinstance(partner_count_request, dict):
+        rows_by_partner_count = partner_count_request
+    else:
+        rows_by_partner_count = {partner_count: 0 for partner_count in partner_count_request}
+        available_by_partner_count = {
+            partner_count: (
+                math.comb(len(partners), partner_count)
+                - sum(1 for group in seen if len(group) == partner_count)
+            )
+            for partner_count in partner_count_request
+        }
+        take = min(count, sum(available_by_partner_count.values()))
+        while sum(rows_by_partner_count.values()) < take:
+            available_counts = [
+                partner_count
+                for partner_count, available in available_by_partner_count.items()
+                if rows_by_partner_count[partner_count] < available
+            ]
+            partner_count = int(rng.choice(available_counts))
+            rows_by_partner_count[partner_count] += 1
 
     for partner_count, requested_rows in sorted(rows_by_partner_count.items()):
         possible_count = math.comb(len(partners), partner_count)
@@ -110,20 +131,18 @@ def sample_partner_groups(
                 if candidate not in seen
             ]
             rng.shuffle(candidates)
-            selected = candidates[:take]
+            for group in candidates[:take]:
+                seen.add(group)
+                groups.append(group)
         else:
-            selected = []
-            selected_seen = set()
-            while len(selected) < take:
+            selected_count = 0
+            while selected_count < take:
                 candidate = tuple(sorted(rng.choice(partners, size=partner_count, replace=False)))
-                if candidate in seen or candidate in selected_seen:
+                if candidate in seen:
                     continue
-                selected_seen.add(candidate)
-                selected.append(candidate)
-
-        for group in selected:
-            seen.add(group)
-            groups.append(group)
+                seen.add(candidate)
+                groups.append(candidate)
+                selected_count += 1
 
     return groups
 
@@ -215,34 +234,6 @@ def presence_from_groups(
     return presence
 
 
-def draw_random_partner_groups(
-    partners: list[str],
-    partner_counts: list[int],
-    rng: np.random.Generator,
-    count: int,
-    excluded: set[tuple[str, ...]],
-) -> list[tuple[str, ...]]:
-    seen = set(excluded)
-    rows_by_partner_count = {partner_count: 0 for partner_count in partner_counts}
-    available_by_partner_count = {
-        partner_count: (
-            math.comb(len(partners), partner_count)
-            - sum(1 for group in seen if len(group) == partner_count)
-        )
-        for partner_count in partner_counts
-    }
-    take = min(count, sum(available_by_partner_count.values()))
-    while sum(rows_by_partner_count.values()) < take:
-        available_counts = [
-            partner_count
-            for partner_count, available in available_by_partner_count.items()
-            if rows_by_partner_count[partner_count] < available
-        ]
-        partner_count = int(rng.choice(available_counts))
-        rows_by_partner_count[partner_count] += 1
-    return sample_partner_groups(partners, rows_by_partner_count, rng, excluded)
-
-
 def fill_remaining_explore_groups(
     measured: list[tuple[str, ...]],
     measured_set: set[tuple[str, ...]],
@@ -254,12 +245,12 @@ def fill_remaining_explore_groups(
 ) -> list[tuple[str, ...]]:
     if len(measured) >= budget:
         return measured[:budget]
-    remaining = draw_random_partner_groups(
+    remaining = sample_partner_groups(
         partners,
         partner_counts,
         rng,
-        budget - len(measured),
         set(excluded) | measured_set,
+        count=budget - len(measured),
     )
     measured.extend(remaining)
     return measured[:budget]
@@ -298,12 +289,12 @@ def max_diversity_explore_groups(
     excluded: set[tuple[str, ...]],
     proposal_candidate_size: int,
 ) -> list[tuple[str, ...]]:
-    candidates = draw_random_partner_groups(
+    candidates = sample_partner_groups(
         partners,
         partner_counts,
         rng,
-        max(proposal_candidate_size, budget),
         excluded,
+        count=max(proposal_candidate_size, budget),
     )
     if not candidates:
         return []
@@ -375,7 +366,7 @@ def greedy_forward_explore_groups(
     measured: list[tuple[str, ...]] = []
     measured_set: set[tuple[str, ...]] = set()
     while len(measured) < budget:
-        current = draw_random_partner_groups(partners, partner_counts, rng, 1, measured_set)
+        current = sample_partner_groups(partners, partner_counts, rng, measured_set, count=1)
         if not current:
             break
         current_group = current[0]
@@ -408,7 +399,7 @@ def simulated_annealing_explore_groups(
     measured: list[tuple[str, ...]] = []
     measured_set: set[tuple[str, ...]] = set()
     while len(measured) < budget:
-        start = draw_random_partner_groups(partners, partner_counts, rng, 1, measured_set)
+        start = sample_partner_groups(partners, partner_counts, rng, measured_set, count=1)
         if not start:
             break
         current = start[0]
@@ -439,7 +430,7 @@ def genetic_algorithm_explore_groups(
 ) -> list[tuple[str, ...]]:
     measured: list[tuple[str, ...]] = []
     measured_set: set[tuple[str, ...]] = set()
-    population = draw_random_partner_groups(partners, partner_counts, rng, 24, set())
+    population = sample_partner_groups(partners, partner_counts, rng, set(), count=24)
     while len(measured) < budget and population:
         fitness = np.array([evaluate_group(group, evaluator, measured, measured_set) for group in population])
         elite = population[int(np.argmin(fitness))]
@@ -466,7 +457,7 @@ def genetic_algorithm_explore_groups(
                         child.extend(rng.choice(additions, size=min(needed, len(additions)), replace=False))
             group = tuple(sorted(child))
             if group in offspring:
-                replacement = draw_random_partner_groups(partners, partner_counts, rng, 1, set(offspring))
+                replacement = sample_partner_groups(partners, partner_counts, rng, set(offspring), count=1)
                 if replacement:
                     group = replacement[0]
             offspring.append(group)
@@ -485,7 +476,7 @@ def explore_groups(
     proposal_candidate_size: int,
 ) -> list[tuple[str, ...]]:
     if method == "random":
-        return draw_random_partner_groups(partners, partner_counts, rng, budget, excluded)
+        return sample_partner_groups(partners, partner_counts, rng, excluded, count=budget)
     if method == "size_balanced":
         return size_balanced_explore_groups(partners, partner_counts, rng, budget, excluded)
     if method == "max_diversity":
@@ -659,12 +650,12 @@ def bayesian_iterative_groups(
             measured_indices,
             seed + len(measured_groups),
         )
-        candidate_groups = draw_random_partner_groups(
+        candidate_groups = sample_partner_groups(
             partners,
             partner_counts,
             rng,
-            proposal_candidate_size,
             blocked | measured_set,
+            count=proposal_candidate_size,
         )
         if not candidate_groups:
             break
@@ -725,23 +716,23 @@ def optimizer_recommendations(
     proposal_candidate_size: int,
 ) -> tuple[list[tuple[str, ...]], np.ndarray, int]:
     rng = np.random.default_rng(seed)
-    candidates = draw_random_partner_groups(
+    candidates = sample_partner_groups(
         partners,
         partner_counts,
         rng,
-        max(proposal_candidate_size, top_k),
         set(),
+        count=max(proposal_candidate_size, top_k),
     )
 
     if optimizer == "predicted_best":
         score_groups(candidates)
     elif optimizer == "greedy_forward":
-        starts = draw_random_partner_groups(
+        starts = sample_partner_groups(
             partners,
             partner_counts,
             rng,
-            min(32, max(1, proposal_candidate_size // 20)),
             set(),
+            count=min(32, max(1, proposal_candidate_size // 20)),
         )
         candidates.extend(starts)
         for start in starts:
@@ -760,12 +751,12 @@ def optimizer_recommendations(
                 current = neighbors[best_index]
                 current_score = best_score
     elif optimizer == "simulated_annealing":
-        starts = draw_random_partner_groups(
+        starts = sample_partner_groups(
             partners,
             partner_counts,
             rng,
-            12,
             set(),
+            count=12,
         )
         candidates.extend(starts)
         for start in starts:
@@ -785,7 +776,7 @@ def optimizer_recommendations(
                     current_score = proposal_score
                 temperature *= 0.98
     elif optimizer == "genetic_algorithm":
-        population = draw_random_partner_groups(partners, partner_counts, rng, 48, set())
+        population = sample_partner_groups(partners, partner_counts, rng, set(), count=48)
         candidates.extend(population)
         for _generation in range(60):
             scores = score_groups(population)
@@ -809,7 +800,7 @@ def optimizer_recommendations(
                     child.extend(rng.choice(additions, size=target_size - len(child), replace=False))
                 group = tuple(sorted(child))
                 if group in offspring:
-                    replacement = draw_random_partner_groups(partners, partner_counts, rng, 1, set(offspring))
+                    replacement = sample_partner_groups(partners, partner_counts, rng, set(offspring), count=1)
                     if replacement:
                         group = replacement[0]
                 offspring.append(group)
