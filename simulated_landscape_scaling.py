@@ -346,132 +346,10 @@ def valid_neighbor_groups(
     return sorted(set(neighbors))
 
 
-def evaluate_group(
-    group: tuple[str, ...],
-    evaluator,
-    measured: list[tuple[str, ...]],
-    measured_set: set[tuple[str, ...]],
-) -> float:
-    if group not in measured_set:
-        measured.append(group)
-        measured_set.add(group)
-    return evaluator.measure(group)
-
-
-def greedy_forward_explore_groups(
-    partners: list[str],
-    partner_counts: list[int],
-    evaluator,
-    rng: np.random.Generator,
-    budget: int,
-) -> list[tuple[str, ...]]:
-    measured: list[tuple[str, ...]] = []
-    measured_set: set[tuple[str, ...]] = set()
-    while len(measured) < budget:
-        current = sample_partner_groups(partners, partner_counts, rng, measured_set, count=1)
-        if not current:
-            break
-        current_group = current[0]
-        evaluate_group(current_group, evaluator, measured, measured_set)
-        while len(measured) < budget:
-            add_neighbors = [
-                tuple(sorted((*current_group, partner)))
-                for partner in partners
-                if partner not in current_group
-                and len(current_group) + 1 in set(partner_counts)
-            ]
-            add_neighbors = [group for group in add_neighbors if group not in measured_set]
-            if not add_neighbors:
-                break
-            scores = [evaluate_group(group, evaluator, measured, measured_set) for group in add_neighbors]
-            best = add_neighbors[int(np.argmin(scores))]
-            if evaluator.measure(best) >= evaluator.measure(current_group):
-                break
-            current_group = best
-    return fill_remaining_explore_groups(measured, measured_set, partners, partner_counts, rng, budget, set())
-
-
-def simulated_annealing_explore_groups(
-    partners: list[str],
-    partner_counts: list[int],
-    evaluator,
-    rng: np.random.Generator,
-    budget: int,
-) -> list[tuple[str, ...]]:
-    measured: list[tuple[str, ...]] = []
-    measured_set: set[tuple[str, ...]] = set()
-    while len(measured) < budget:
-        start = sample_partner_groups(partners, partner_counts, rng, measured_set, count=1)
-        if not start:
-            break
-        current = start[0]
-        current_score = evaluate_group(current, evaluator, measured, measured_set)
-        temperature = 0.5
-        for _iteration in range(250):
-            if len(measured) >= budget:
-                break
-            neighbors = valid_neighbor_groups(current, partners, partner_counts)
-            if not neighbors:
-                break
-            proposal = neighbors[int(rng.integers(len(neighbors)))]
-            proposal_score = evaluate_group(proposal, evaluator, measured, measured_set)
-            delta = proposal_score - current_score
-            if delta < 0 or rng.random() < np.exp(-delta / max(temperature, 1e-12)):
-                current = proposal
-                current_score = proposal_score
-            temperature *= 0.98
-    return fill_remaining_explore_groups(measured, measured_set, partners, partner_counts, rng, budget, set())
-
-
-def genetic_algorithm_explore_groups(
-    partners: list[str],
-    partner_counts: list[int],
-    evaluator,
-    rng: np.random.Generator,
-    budget: int,
-) -> list[tuple[str, ...]]:
-    measured: list[tuple[str, ...]] = []
-    measured_set: set[tuple[str, ...]] = set()
-    population = sample_partner_groups(partners, partner_counts, rng, set(), count=24)
-    while len(measured) < budget and population:
-        fitness = np.array([evaluate_group(group, evaluator, measured, measured_set) for group in population])
-        elite = population[int(np.argmin(fitness))]
-        offspring = [elite]
-        while len(offspring) < 24:
-            parent_a = population[int(rng.integers(len(population)))]
-            parent_b = population[int(rng.integers(len(population)))]
-            genes = sorted(set(parent_a) | set(parent_b))
-            child = [gene for gene in genes if rng.random() < 0.5]
-            for partner in partners:
-                if rng.random() < 0.02:
-                    if partner in child:
-                        child.remove(partner)
-                    else:
-                        child.append(partner)
-            if len(child) not in partner_counts:
-                target_size = int(rng.choice(partner_counts))
-                if len(child) > target_size:
-                    child = list(rng.choice(child, size=target_size, replace=False))
-                else:
-                    additions = [partner for partner in partners if partner not in child]
-                    needed = target_size - len(child)
-                    if needed > 0 and additions:
-                        child.extend(rng.choice(additions, size=min(needed, len(additions)), replace=False))
-            group = tuple(sorted(child))
-            if group in offspring:
-                replacement = sample_partner_groups(partners, partner_counts, rng, set(offspring), count=1)
-                if replacement:
-                    group = replacement[0]
-            offspring.append(group)
-        population = offspring
-    return fill_remaining_explore_groups(measured, measured_set, partners, partner_counts, rng, budget, set())
-
-
-def explore_groups(
+def phase1_measurement_groups(
     method: str,
     partners: list[str],
     partner_counts: list[int],
-    evaluator,
     rng: np.random.Generator,
     budget: int,
     excluded: set[tuple[str, ...]],
@@ -490,13 +368,7 @@ def explore_groups(
             excluded,
             proposal_candidate_size,
         )
-    if method == "greedy_forward":
-        return greedy_forward_explore_groups(partners, partner_counts, evaluator, rng, budget)
-    if method == "simulated_annealing":
-        return simulated_annealing_explore_groups(partners, partner_counts, evaluator, rng, budget)
-    if method == "genetic_algorithm":
-        return genetic_algorithm_explore_groups(partners, partner_counts, evaluator, rng, budget)
-    raise ValueError(f"Unknown strategy: {method}")
+    raise ValueError(f"Unknown Phase 1 measurement strategy: {method}")
 
 
 def simulate_partner_groups(
@@ -708,7 +580,7 @@ def fit_model(dataset, model_name: str, feature_set: str, train_indices: np.ndar
     return model, features
 
 
-def optimizer_recommendations(
+def run_phase2_optimizer(
     optimizer: str,
     score_groups,
     partners: list[str],
@@ -717,6 +589,7 @@ def optimizer_recommendations(
     top_k: int,
     proposal_candidate_size: int,
 ) -> tuple[list[tuple[str, ...]], np.ndarray, int]:
+    """Walk a simulator or surrogate landscape and return the top recommendations."""
     rng = np.random.default_rng(seed)
     candidates = sample_partner_groups(
         partners,
@@ -1614,7 +1487,7 @@ def run_simulated_scaling(
 
             direct_optimizer_results = {}
             for optimizer in phase2_optimizers:
-                recommendation_groups, search_scores, evaluated_count = optimizer_recommendations(
+                recommendation_groups, search_scores, evaluated_count = run_phase2_optimizer(
                     optimizer,
                     score_direct_groups,
                     partners,
@@ -1664,11 +1537,10 @@ def run_simulated_scaling(
                     )
                     final_measured_summary = evaluator.summary_for(ordered_groups)
                 else:
-                    ordered_groups = explore_groups(
+                    ordered_groups = phase1_measurement_groups(
                         strategy,
                         partners,
                         valid_partner_counts,
-                        evaluator,
                         strategy_rng,
                         max_budget,
                         audit_group_set,
@@ -1792,7 +1664,7 @@ def run_simulated_scaling(
                             return np.array([surrogate_scores[group] for group in groups], dtype=float)
 
                         for optimizer in phase2_optimizers:
-                            recommendation_groups, search_scores, evaluated_count = optimizer_recommendations(
+                            recommendation_groups, search_scores, evaluated_count = run_phase2_optimizer(
                                 optimizer,
                                 score_surrogate_groups,
                                 partners,

@@ -73,8 +73,8 @@ Parameter notes:
 - `--batch-size`: acquisition batch size for Bayesian optimization. It does not control the reporting checkpoints when `--budgets` is explicit.
 - `--seeds`: number of independent landscape/acquisition repeats.
 - `--models`: surrogate models trained at each measured-row budget. `gnn` is much slower than the other listed models.
-- `--strategies`: Phase 1 measurement/acquisition strategies that generate the training rows.
-- `--phase2-optimizers`: Phase 2 optimizers that walk either the trained surrogate landscape or the direct simulator baseline.
+- `--strategies`: Phase 1 measurement/acquisition strategies that generate the training rows: `random`, `size_balanced`, `max_diversity`, and `bayesian_optimization`.
+- `--phase2-optimizers`: Phase 2 optimizers that walk either the trained surrogate landscape or the direct simulator baseline: `predicted_best`, `greedy_forward`, `simulated_annealing`, and `genetic_algorithm`.
 - `--phase2-top-k`: number of optimizer recommendations validated and reported.
 - `--interaction-generator`: generator used to create the GLV interaction table. `hierarchical` adds trait-like dominant species structure.
 - `--carrying-capacity-min` / `--carrying-capacity-max`: range used to set species self-interaction strengths in the hierarchical generator.
