@@ -542,6 +542,17 @@ def simulate_partner_groups(
     )
 
 
+def partner_groups_from_summary(summary: pd.DataFrame, target_species: str) -> list[tuple[str, ...]]:
+    groups = []
+    for community in summary["community"].astype(str):
+        groups.append(tuple(
+            species
+            for species in community.split(";")
+            if species and species != target_species
+        ))
+    return groups
+
+
 def stable_group_seed(base_seed: int, group: tuple[str, ...]) -> int:
     offset = 0
     for item in group:
@@ -1510,11 +1521,16 @@ def run_simulated_scaling(
             if not audit_rows_by_count:
                 largest_count = max(possible_by_count, key=possible_by_count.get)
                 audit_rows_by_count[largest_count] = 1
-            audit_groups = sample_partner_groups(
-                partners,
-                audit_rows_by_count,
-                rng,
-            )
+            audit_path = pools_path / f"{run_id}_audit_pool.csv"
+            if audit_path.exists():
+                audit_summary = pd.read_csv(audit_path)
+                audit_groups = partner_groups_from_summary(audit_summary, run_target_species)
+            else:
+                audit_groups = sample_partner_groups(
+                    partners,
+                    audit_rows_by_count,
+                    rng,
+                )
             audit_group_set = set(audit_groups)
             search_space_rows = max(0, total_groups - len(audit_group_set))
             max_budget = min(max(budgets), search_space_rows)
@@ -1539,15 +1555,15 @@ def run_simulated_scaling(
                 "assay_noise_scale": assay_noise_scale,
                 "target_scale_mapping": target_scale_mapping,
             }
-            audit_summary = simulate_partner_groups(
-                interaction_data,
-                audit_groups,
-                seed=run_seed + 29,
-                **simulation_kwargs,
-            )
-            audit_summary["pool"] = "audit"
-            audit_path = pools_path / f"{run_id}_audit_pool.csv"
-            audit_summary.to_csv(audit_path, index=False)
+            if not audit_path.exists():
+                audit_summary = simulate_partner_groups(
+                    interaction_data,
+                    audit_groups,
+                    seed=run_seed + 29,
+                    **simulation_kwargs,
+                )
+                audit_summary["pool"] = "audit"
+                audit_summary.to_csv(audit_path, index=False)
             suppressor_target_scale = "raw" if target_scale_mapping == "latent" else "log"
 
             run_rows.append({
@@ -1624,7 +1640,11 @@ def run_simulated_scaling(
                 strategy_rng = np.random.default_rng(strategy_seed)
                 evaluator = direct_evaluator
                 strategy_workspace = pools_path / f"{run_id}_{strategy}_evaluation.csv"
-                if strategy == "bayesian_optimization":
+                final_measured_path = pools_path / f"{run_id}_{strategy}_measured.csv"
+                if final_measured_path.exists():
+                    final_measured_summary = pd.read_csv(final_measured_path)
+                    ordered_groups = partner_groups_from_summary(final_measured_summary, run_target_species)
+                elif strategy == "bayesian_optimization":
                     ordered_groups = bayesian_iterative_groups(
                         partners,
                         valid_partner_counts,
@@ -1640,6 +1660,7 @@ def run_simulated_scaling(
                         audit_group_set,
                         proposal_candidate_size,
                     )
+                    final_measured_summary = evaluator.summary_for(ordered_groups)
                 else:
                     ordered_groups = explore_groups(
                         strategy,
@@ -1651,17 +1672,16 @@ def run_simulated_scaling(
                         audit_group_set,
                         proposal_candidate_size,
                     )
-
-                final_measured_summary = evaluator.summary_for(ordered_groups)
+                    final_measured_summary = evaluator.summary_for(ordered_groups)
                 final_measured_summary["pool"] = "measured"
-                final_measured_path = pools_path / f"{run_id}_{strategy}_measured.csv"
-                final_measured_summary.to_csv(final_measured_path, index=False)
+                if not final_measured_path.exists():
+                    final_measured_summary.to_csv(final_measured_path, index=False)
                 valid_budgets = [budget for budget in budgets if budget <= len(ordered_groups)]
                 if len(ordered_groups) and not valid_budgets:
                     valid_budgets = [len(ordered_groups)]
 
                 for measured_count in valid_budgets:
-                    measured_summary = evaluator.summary_for(ordered_groups[:measured_count])
+                    measured_summary = final_measured_summary.iloc[:measured_count].copy()
                     evaluation_path = pools_path / f"{run_id}_{strategy}_{measured_count}_evaluation.csv"
                     dataset, measured_indices, audit_indices, _evaluation_summary = build_evaluation_dataset(
                         measured_summary,
@@ -1687,6 +1707,8 @@ def run_simulated_scaling(
                         if not np.any(audit_mask):
                             continue
                         train_mask = in_band(train_partner_counts)
+                        if not np.any(train_mask):
+                            continue
                         evaluation_slices.append((
                             band.display_label,
                             audit_indices[audit_mask],
