@@ -451,8 +451,11 @@ def build_evaluation_dataset(
     audit = audit_summary.copy()
     measured["pool"] = "measured"
     audit["pool"] = "audit"
-    evaluation_summary = pd.concat([measured, audit], ignore_index=True)
-    evaluation_summary.to_csv(path, index=False)
+    if path.exists():
+        evaluation_summary = pd.read_csv(path)
+    else:
+        evaluation_summary = pd.concat([measured, audit], ignore_index=True)
+        evaluation_summary.to_csv(path, index=False)
     dataset = load_dataset(str(path), target_species, species_ids)
     measured_indices = np.flatnonzero(evaluation_summary["pool"].eq("measured").to_numpy())
     audit_indices = np.flatnonzero(evaluation_summary["pool"].eq("audit").to_numpy())
@@ -1318,29 +1321,32 @@ def run_simulated_scaling(
 
     for seed_index in range(seeds):
         universe_seed = base_seed + seed_index
-        # One max-species universe keeps species-count comparisons nested.
-        universe_interaction_data = generate_interaction_data(
-            species_count=max_species_count,
-            interaction_range=interaction_range,
-            off_diagonal_min=off_diagonal_min,
-            off_diagonal_max=off_diagonal_max,
-            growth_rate=growth_rate,
-            self_interaction=self_interaction,
-            target_species=common_target_species,
-            target_self_interaction=target_self_interaction,
-            effect_prior_csv=effect_prior_csv,
-            target_effect_scale=target_effect_scale,
-            pair_effect_scale=pair_effect_scale,
-            seed=universe_seed,
-            interaction_generator=interaction_generator,
-            carrying_capacity_min=carrying_capacity_min,
-            carrying_capacity_max=carrying_capacity_max,
-            hierarchy_strength=hierarchy_strength,
-            hierarchy_noise=hierarchy_noise,
-            target_interaction_scale=target_interaction_scale,
-        )
         universe_path = inputs_path / f"universe_species_{max_species_count}_seed_{universe_seed}_interactions.csv"
-        universe_interaction_data.to_csv(universe_path, index=False)
+        if universe_path.exists():
+            universe_interaction_data = pd.read_csv(universe_path)
+        else:
+            # One max-species universe keeps species-count comparisons nested.
+            universe_interaction_data = generate_interaction_data(
+                species_count=max_species_count,
+                interaction_range=interaction_range,
+                off_diagonal_min=off_diagonal_min,
+                off_diagonal_max=off_diagonal_max,
+                growth_rate=growth_rate,
+                self_interaction=self_interaction,
+                target_species=common_target_species,
+                target_self_interaction=target_self_interaction,
+                effect_prior_csv=effect_prior_csv,
+                target_effect_scale=target_effect_scale,
+                pair_effect_scale=pair_effect_scale,
+                seed=universe_seed,
+                interaction_generator=interaction_generator,
+                carrying_capacity_min=carrying_capacity_min,
+                carrying_capacity_max=carrying_capacity_max,
+                hierarchy_strength=hierarchy_strength,
+                hierarchy_noise=hierarchy_noise,
+                target_interaction_scale=target_interaction_scale,
+            )
+            universe_interaction_data.to_csv(universe_path, index=False)
 
         for species_count in species_counts:
             run_target_species = common_target_species
@@ -1355,12 +1361,15 @@ def run_simulated_scaling(
             run_seed = base_seed + species_count * 1000 + seed_index
             rng = np.random.default_rng(run_seed)
             run_id = f"species_{species_count}_seed_{run_seed}"
-            # Subset the shared universe instead of regenerating a new landscape.
-            interaction_data = universe_interaction_data[
-                universe_interaction_data["species_id"].isin(species_ids)
-            ].copy()
             interaction_path = inputs_path / f"{run_id}_interactions.csv"
-            interaction_data.to_csv(interaction_path, index=False)
+            if interaction_path.exists():
+                interaction_data = pd.read_csv(interaction_path)
+            else:
+                # Subset the shared universe instead of regenerating a new landscape.
+                interaction_data = universe_interaction_data[
+                    universe_interaction_data["species_id"].isin(species_ids)
+                ].copy()
+                interaction_data.to_csv(interaction_path, index=False)
 
             possible_by_count = {
                 count: math.comb(len(partners), count)
@@ -1465,30 +1474,38 @@ def run_simulated_scaling(
                         direct_scores[group] = direct_evaluator.measure(group)
                 return np.array([direct_scores[group] for group in groups], dtype=float)
 
-            direct_optimizer_results = {}
-            for optimizer in phase2_optimizers:
-                recommendation_groups, search_scores, evaluated_count = run_phase2_optimizer(
-                    optimizer,
-                    score_direct_groups,
-                    partners,
-                    valid_partner_counts,
-                    run_seed + 600_000 + sum(ord(char) for char in optimizer),
-                    phase2_top_k,
-                    proposal_candidate_size,
-                )
-                validated_summary = direct_evaluator.summary_for(recommendation_groups)
-                validated_values = validated_summary["final_target_biomass"].to_numpy(dtype=float)
-                best_position = int(np.argmin(validated_values))
-                direct_optimizer_results[optimizer] = {
-                    "optimizer": optimizer,
-                    "recommended_count": int(len(recommendation_groups)),
-                    "optimizer_evaluated_count": int(evaluated_count),
-                    "best_search_score": float(np.min(search_scores)),
-                    "best_validated_biomass": float(validated_values[best_position]),
-                    "mean_validated_biomass": float(np.mean(validated_values)),
-                    "best_recommended_community": validated_summary["community"].iloc[best_position],
-                    "best_recommended_partner_count": int(validated_summary["partner_count"].iloc[best_position]),
+            direct_phase2_path = pools_path / f"{run_id}_direct_phase2.csv"
+            if direct_phase2_path.exists():
+                direct_optimizer_results = {
+                    row["optimizer"]: row
+                    for row in pd.read_csv(direct_phase2_path).to_dict("records")
                 }
+            else:
+                direct_optimizer_results = {}
+                for optimizer in phase2_optimizers:
+                    recommendation_groups, search_scores, evaluated_count = run_phase2_optimizer(
+                        optimizer,
+                        score_direct_groups,
+                        partners,
+                        valid_partner_counts,
+                        run_seed + 600_000 + sum(ord(char) for char in optimizer),
+                        phase2_top_k,
+                        proposal_candidate_size,
+                    )
+                    validated_summary = direct_evaluator.summary_for(recommendation_groups)
+                    validated_values = validated_summary["final_target_biomass"].to_numpy(dtype=float)
+                    best_position = int(np.argmin(validated_values))
+                    direct_optimizer_results[optimizer] = {
+                        "optimizer": optimizer,
+                        "recommended_count": int(len(recommendation_groups)),
+                        "optimizer_evaluated_count": int(evaluated_count),
+                        "best_search_score": float(np.min(search_scores)),
+                        "best_validated_biomass": float(validated_values[best_position]),
+                        "mean_validated_biomass": float(np.mean(validated_values)),
+                        "best_recommended_community": validated_summary["community"].iloc[best_position],
+                        "best_recommended_partner_count": int(validated_summary["partner_count"].iloc[best_position]),
+                    }
+                pd.DataFrame(direct_optimizer_results.values()).to_csv(direct_phase2_path, index=False)
 
             for strategy in strategies:
                 strategy_seed = run_seed + sum(ord(char) for char in strategy)
@@ -1535,6 +1552,19 @@ def run_simulated_scaling(
                     valid_budgets = [len(ordered_groups)]
 
                 for measured_count in valid_budgets:
+                    metrics_checkpoint_path = (
+                        pools_path / f"{run_id}_{strategy}_{measured_count}_metrics.csv"
+                    )
+                    phase2_checkpoint_path = (
+                        pools_path / f"{run_id}_{strategy}_{measured_count}_phase2.csv"
+                    )
+                    if metrics_checkpoint_path.exists() and phase2_checkpoint_path.exists():
+                        metric_rows.extend(pd.read_csv(metrics_checkpoint_path).to_dict("records"))
+                        phase2_rows.extend(pd.read_csv(phase2_checkpoint_path).to_dict("records"))
+                        continue
+
+                    budget_metric_rows = []
+                    budget_phase2_rows = []
                     measured_summary = final_measured_summary.iloc[:measured_count].copy()
                     evaluation_path = pools_path / f"{run_id}_{strategy}_{measured_count}_evaluation.csv"
                     dataset, measured_indices, audit_indices, _evaluation_summary = build_evaluation_dataset(
@@ -1572,7 +1602,7 @@ def run_simulated_scaling(
                         ))
 
                     for optimizer, result in direct_optimizer_results.items():
-                        phase2_rows.append({
+                        budget_phase2_rows.append({
                             "run_id": run_id,
                             "species_count": species_count,
                             "seed": run_seed,
@@ -1630,7 +1660,7 @@ def run_simulated_scaling(
                                 buffer_z,
                                 suppressor_target_scale,
                             ))
-                            metric_rows.append(row)
+                            budget_metric_rows.append(row)
 
                         surrogate_scores: dict[tuple[str, ...], float] = {}
 
@@ -1657,7 +1687,7 @@ def run_simulated_scaling(
                             validated_values = validated_summary["final_target_biomass"].to_numpy(dtype=float)
                             best_position = int(np.argmin(validated_values))
                             best_validated = float(validated_values[best_position])
-                            phase2_rows.append({
+                            budget_phase2_rows.append({
                                 **row_base,
                                 "search_source": "surrogate",
                                 "optimizer": optimizer,
@@ -1669,6 +1699,10 @@ def run_simulated_scaling(
                                 "best_recommended_community": validated_summary["community"].iloc[best_position],
                                 "best_recommended_partner_count": int(validated_summary["partner_count"].iloc[best_position]),
                             })
+                    pd.DataFrame(budget_metric_rows).to_csv(metrics_checkpoint_path, index=False)
+                    pd.DataFrame(budget_phase2_rows).to_csv(phase2_checkpoint_path, index=False)
+                    metric_rows.extend(budget_metric_rows)
+                    phase2_rows.extend(budget_phase2_rows)
 
     runs = pd.DataFrame(run_rows)
     metrics = pd.DataFrame(metric_rows)
