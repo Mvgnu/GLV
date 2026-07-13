@@ -253,21 +253,26 @@ def glv_derivatives(_time, densities, growth_rates, interaction_matrix):
     return densities * (growth_rates + interaction_matrix @ densities)
 
 
-def saturated_interaction_response(densities, interaction_matrix, saturation_pressure):
+def saturated_interaction_response(densities, off_diagonal_matrix, saturation_pressure):
     """Bound total off-diagonal pressure while retaining signed interaction effects."""
-    off_diagonal = np.array(interaction_matrix, dtype=float).copy()
-    np.fill_diagonal(off_diagonal, 0.0)
-    raw_pressure = off_diagonal @ densities
+    raw_pressure = off_diagonal_matrix @ densities
     return saturation_pressure * np.tanh(raw_pressure / saturation_pressure)
 
 
-def saturating_derivatives(_time, densities, growth_rates, interaction_matrix, saturation_pressure):
+def saturating_derivatives(
+    _time,
+    densities,
+    growth_rates,
+    self_interactions,
+    off_diagonal_matrix,
+    saturation_pressure,
+):
     """Return GLV derivatives with bounded off-diagonal interaction pressure."""
     densities = np.maximum(np.asarray(densities, dtype=float), 0.0)
-    self_pressure = np.diag(interaction_matrix) * densities
+    self_pressure = self_interactions * densities
     interaction_pressure = saturated_interaction_response(
         densities,
-        interaction_matrix,
+        off_diagonal_matrix,
         saturation_pressure,
     )
     return densities * (growth_rates + self_pressure + interaction_pressure)
@@ -279,17 +284,38 @@ def saturating_endpoint(
     initial_density,
     max_time,
     saturation_pressure,
+    fixed_point_threshold=1e-6,
 ):
     """Integrate saturating GLV dynamics and return the terminal density vector."""
     initial = np.full(len(growth_rates), initial_density, dtype=float)
+    self_interactions = np.diag(interaction_matrix).copy()
+    off_diagonal_matrix = np.array(interaction_matrix, dtype=float).copy()
+    np.fill_diagonal(off_diagonal_matrix, 0.0)
+
+    def derivatives(time, densities):
+        return saturating_derivatives(
+            time,
+            densities,
+            growth_rates,
+            self_interactions,
+            off_diagonal_matrix,
+            saturation_pressure,
+        )
+
+    def fixed_point_reached(time, densities):
+        density_derivatives = derivatives(time, densities)
+        return float(np.sqrt(np.mean(np.square(density_derivatives)))) - fixed_point_threshold
+
+    fixed_point_reached.terminal = True
+    fixed_point_reached.direction = -1
     solution = solve_ivp(
-        saturating_derivatives,
+        derivatives,
         t_span=(0.0, max_time),
         y0=initial,
-        args=(growth_rates, interaction_matrix, saturation_pressure),
         method="RK45",
         rtol=1e-6,
         atol=1e-9,
+        events=fixed_point_reached,
     )
     return np.maximum(solution.y[:, -1], 0.0)
 

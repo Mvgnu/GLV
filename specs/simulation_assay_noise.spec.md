@@ -4,6 +4,7 @@ description: "Calibrate lab-like assay noise from real-world replicates and expo
 paths:
   service: GLV_ML/simulation_assay_noise.py
   calibration: GLV_ML/calibrate_simulation_rates.py
+  tests: GLV_ML/tests/test_simulated_landscape_scaling.py
   outputs: GLV_ML/outputs/calibration/
 exports:
   - assay_noise_model.json
@@ -27,6 +28,7 @@ consumes:
   - ml_benchmark.TargetBiomassDataset
 verification:
   syntax: ".venv/bin/python -m py_compile GLV_ML/simulation_assay_noise.py"
+  tests: ".venv/bin/python -m unittest discover -s GLV_ML/tests -v"
   smoke: ".venv/bin/python GLV_ML/simulation_assay_noise.py --rw-summary GLV_ML/outputs/real_world/log/rw_summary.csv --simulation-summary GLV_ML/outputs/simulation/exhaustive/outputs_target_12_species_bounded/all_summary_stats.csv --target-species pathogen --simulation-target-species sp_012 --output-dir GLV_ML/outputs/calibration/assay_noise_smoke"
   calibration_smoke: ".venv/bin/python GLV_ML/calibrate_simulation_rates.py --rw-summary GLV_ML/outputs/real_world/log/rw_summary.csv --effect-prior-csv GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv --output-dir GLV_ML/outputs/calibration/suppressor_rates_smoke --species-count 12 --target-species sp_012 --target-effect-scales 0,0.25 --pair-effect-scales 0,0.25 --partner-count-effect-scales 0,0.5 --partner-count-effect-centers 6.0 --partner-count-effect-widths 2.5"
 ---
@@ -53,10 +55,18 @@ deviation. Scale `1.0` is calibrated lab-like noise; scale `0.0` keeps the real-
 mean mapping but emits deterministic, zero-SD observations for idealized model-capacity
 checks.
 
-Callers may also choose the target-scale mapping. `zscore` preserves the historical
-real-scale mapping from latent GLV biomass to real pathogen signal. `latent` leaves GLV
-biomass on its native nonnegative scale before optional assay noise, avoiding the
-artificial remapped extinction floor used by z-score mapping.
+Callers may also choose the target-scale mapping. `quantile` is the preferred noisy
+assay mode: it preserves the simulator ranking while mapping labels onto the empirical
+real-world pathogen-signal distribution before noise is applied. Scaling runs fit this
+mapping on an independent calibration landscape and reuse it for measured rows, audit
+rows, and phase-2 validation. `zscore` uses the same fixed calibration reference with a
+mean/std mapping. `latent` leaves GLV biomass on its native nonnegative scale and is best
+used for noiseless simulator-mechanics checks.
+
+Quantile mapping interpolates within the calibration distribution and linearly
+extrapolates beyond its tails. Assay values remain nonnegative, but they are not clipped
+to the empirical minimum or maximum of the real dataset because those sample extrema are
+not physical assay bounds.
 
 This domain also exports full-data ridge-pairwise effects from the real-world data.
 Negative coefficients mean a species or pair predicts lower pathogen biomass on the
@@ -80,4 +90,5 @@ phenomenological size-response correction applied before assay noise. Positive s
 makes communities near the center more suppressive while pushing very small and very
 large communities away from suppression. It exists specifically to test whether the real
 mid-size suppressor band can be reproduced without pretending pairwise coefficients
-alone explain it.
+alone explain it. The adjustment is an absolute function of partner count and therefore
+does not change when rows are evaluated individually rather than in one batch.

@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from lotka_volterra import generate_interaction_data, saturating_endpoint
-from simulation_assay_noise import fit_assay_noise_model, sample_assay_sd
+from simulation_assay_noise import AssayNoiseModel, fit_assay_noise_model, sample_assay_sd
 
 
 def parse_float_grid(value: str) -> list[float]:
@@ -186,7 +186,44 @@ def zscore_map_to_reference(values: np.ndarray, reference: np.ndarray) -> np.nda
             * reference_std
             + float(np.mean(reference))
         )
-    return np.clip(mapped, float(np.min(reference)), float(np.max(reference)))
+    return mapped
+
+
+def fixed_quantile_map(
+    values: np.ndarray,
+    calibration_values: np.ndarray,
+    reference: np.ndarray,
+) -> np.ndarray:
+    """Map values by their rank in a fixed latent calibration distribution."""
+    calibration = np.sort(np.asarray(calibration_values, dtype=float))
+    value_array = np.asarray(values, dtype=float)
+    if len(calibration) == 1 or calibration[0] == calibration[-1]:
+        return np.full(len(value_array), float(np.median(reference)))
+
+    quantiles = np.linspace(0.0, 1.0, len(calibration))
+    mapped_quantiles = np.quantile(reference, quantiles)
+    mapped = np.interp(value_array, calibration, mapped_quantiles)
+
+    lower_index = int(np.flatnonzero(calibration > calibration[0])[0])
+    lower_slope = (
+        (mapped_quantiles[lower_index] - mapped_quantiles[0])
+        / (calibration[lower_index] - calibration[0])
+    )
+    lower_mask = value_array < calibration[0]
+    mapped[lower_mask] = mapped_quantiles[0] + lower_slope * (
+        value_array[lower_mask] - calibration[0]
+    )
+
+    upper_index = int(np.flatnonzero(calibration < calibration[-1])[-1])
+    upper_slope = (
+        (mapped_quantiles[-1] - mapped_quantiles[upper_index])
+        / (calibration[-1] - calibration[upper_index])
+    )
+    upper_mask = value_array > calibration[-1]
+    mapped[upper_mask] = mapped_quantiles[-1] + upper_slope * (
+        value_array[upper_mask] - calibration[-1]
+    )
+    return mapped
 
 
 def partner_count_adjustment(
@@ -200,7 +237,7 @@ def partner_count_adjustment(
         return np.zeros(len(partner_counts), dtype=float)
 
     basis = np.square((partner_counts.astype(float) - center) / width)
-    return scale * (basis - float(np.mean(basis)))
+    return scale * basis
 
 
 def add_assay_observations(
@@ -213,48 +250,55 @@ def add_assay_observations(
     seed: int,
     assay_noise_scale: float = 1.0,
     target_scale_mapping: str = "zscore",
+    mapping_reference_values: np.ndarray | None = None,
+    noise_model: AssayNoiseModel | None = None,
 ) -> pd.DataFrame:
-    noise_model, _fitted = fit_assay_noise_model(real_summary)
+    if noise_model is None:
+        noise_model = fit_assay_noise_model(real_summary)[0]
     rng = np.random.default_rng(seed)
     summary = latent_summary.copy()
     latent_values = summary["latent_target_biomass"].to_numpy(dtype=float)
+    reference_values = real_summary["final_target_biomass"].to_numpy(dtype=float)
+    calibration_values = latent_values if mapping_reference_values is None else mapping_reference_values
     if target_scale_mapping == "zscore":
-        expected_mean = zscore_map_to_reference(
+        if mapping_reference_values is None:
+            expected_mean = zscore_map_to_reference(latent_values, reference_values)
+        else:
+            value_std = float(np.std(calibration_values))
+            if value_std <= 1e-12:
+                expected_mean = np.full(len(latent_values), float(np.mean(reference_values)))
+            else:
+                expected_mean = (
+                    (latent_values - float(np.mean(calibration_values)))
+                    / value_std
+                    * float(np.std(reference_values))
+                    + float(np.mean(reference_values))
+                )
+    elif target_scale_mapping == "quantile":
+        # Preserve simulator rank against one fixed latent calibration distribution.
+        expected_mean = fixed_quantile_map(
             latent_values,
-            real_summary["final_target_biomass"].to_numpy(dtype=float),
+            calibration_values,
+            reference_values,
         )
     elif target_scale_mapping == "latent":
         expected_mean = latent_values.copy()
     else:
-        raise ValueError("target_scale_mapping must be 'zscore' or 'latent'")
+        raise ValueError("target_scale_mapping must be 'zscore', 'quantile', or 'latent'")
     expected_mean = expected_mean + partner_count_adjustment(
         summary["partner_count"].to_numpy(dtype=float),
         partner_count_effect_scale,
         partner_count_effect_center,
         partner_count_effect_width,
     )
-    if target_scale_mapping == "zscore":
-        expected_mean = np.clip(
-            expected_mean,
-            float(real_summary["final_target_biomass"].min()),
-            float(real_summary["final_target_biomass"].max()),
-        )
-    else:
-        expected_mean = np.maximum(expected_mean, 0.0)
+    expected_mean = np.maximum(expected_mean, 0.0)
     expected_sd = sample_assay_sd(noise_model, expected_mean, rng) * assay_noise_scale
     replicate_values = []
     replicate_sds = []
 
     for mean, sd in zip(expected_mean, expected_sd, strict=True):
         values = rng.normal(mean, sd, size=noise_model.replicate_count)
-        if target_scale_mapping == "zscore":
-            values = np.clip(
-                values,
-                noise_model.observed_mean_min,
-                noise_model.observed_mean_max,
-            )
-        else:
-            values = np.maximum(values, 0.0)
+        values = np.maximum(values, 0.0)
         replicate_values.append(float(values.mean()))
         replicate_sds.append(float(values.std(ddof=0)))
 

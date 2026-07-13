@@ -3,8 +3,10 @@ name: simulated_landscape_scaling
 description: "Sampled simulated-landscape benchmarks for surrogate collapse as species count and community size grow"
 paths:
   service: GLV_ML/simulated_landscape_scaling.py
+  tests: GLV_ML/tests/test_simulated_landscape_scaling.py
   outputs: GLV_ML/outputs/benchmarks/scaling_laws_simulated/
 exports:
+  - run_config.json
   - simulated_scaling_runs.csv
   - simulated_scaling_metrics.csv
   - simulated_scaling_summary.csv
@@ -39,6 +41,7 @@ consumes:
   - ml.TargetBiomassDataset loading and model conventions
 verification:
   syntax: ".venv/bin/python -m py_compile GLV_ML/simulated_landscape_scaling.py"
+  tests: ".venv/bin/python -m unittest discover -s GLV_ML/tests -v"
   smoke: ".venv/bin/python GLV_ML/simulated_landscape_scaling.py --species-counts 12 --partner-counts 3-5 --partner-count-bands small:3-5 --proposal-candidate-size 80 --audit-size 40 --audit-fraction 0.25 --budgets 20,40 --batch-size 10 --seeds 1 --models ridge_pairwise --strategies random,size_balanced,max_diversity,bayesian_optimization --phase2-optimizers predicted_best,greedy_forward,simulated_annealing,genetic_algorithm --phase2-top-k 3 --interaction-generator hierarchical --carrying-capacity-min 0.5 --carrying-capacity-max 2.0 --hierarchy-strength 0.15 --hierarchy-noise 0.02 --interaction-response saturating --saturation-pressure 1.0 --target-scale-mapping latent --assay-noise-scale 0 --output-dir GLV_ML/outputs/benchmarks/scaling_laws_simulated_smoke"
 ---
 
@@ -53,26 +56,34 @@ The script does **not** enumerate every possible community by default. For each
 1. Generates one calibrated max-species GLV interaction table per seed.
 2. Takes each requested species count as a nested prefix of that same max-species
    universe, so species-count effects are not confounded with unrelated landscapes.
-3. Samples a disjoint hidden audit pool proportional to each partner-count class.
-4. Lets each exploration strategy propose communities from the remaining combinatorial
+3. Builds one independent max-species calibration landscape for target-scale mapping.
+4. Samples a disjoint hidden audit pool uniformly from the requested community space.
+5. Lets each exploration strategy propose communities from the remaining combinatorial
    space.
-5. Simulates only communities that the strategy actually proposes or probes.
-6. Applies the calibrated assay-noise layer when a real-world summary is available.
-7. Trains requested surrogate models on increasing measured prefixes from that strategy.
-8. Evaluates each model on the fixed audit pool.
-9. Runs Phase 2 optimizers against the trained surrogate and validates their top-k
+6. Simulates only communities that the strategy actually proposes or probes.
+7. Applies the calibrated assay-noise layer when a real-world summary is available.
+8. Trains requested surrogate models on increasing measured prefixes from that strategy.
+9. Evaluates each model on the fixed audit pool.
+10. Runs Phase 2 optimizers against the trained surrogate and validates their top-k
    recommendations with the simulator.
-10. Runs the same Phase 2 optimizers directly against simulator scores as the truth
-    baseline.
+11. Runs the same Phase 2 optimizers against budget-matched noisy simulator measurements,
+    then validates their recommendations against noiseless simulator values.
 
 This is separate from `scaling_laws.py`, which downsamples real-world species universes.
 Here the axis is simulated design-space scale: more partner species, larger possible
 community counts, and fixed measurement budgets.
 
-`--proposal-candidate-size` controls how many unmeasured candidate communities are drawn
-for proposal-based methods such as max-diversity and Bayesian optimization.
+`--proposal-candidate-size` controls candidate pools for max-diversity, Bayesian
+optimization, and Phase 2 `predicted_best`. Walk optimizers evaluate only their own paths.
 `--audit-size` is an absolute audit cap; `--audit-fraction` caps the audit to a fraction
 of the finite combinatorial space for small species pools.
+
+`run_config.json` records the first invocation's input paths and settings for provenance.
+The output directory is the run identity: persisted interaction tables, pools, and
+per-community deterministic noise seeds make an interrupted invocation resumable. The
+manifest is informational and does not reject a resumed run through a configuration hash
+gate; use a new output directory for a scientifically different run. Evaluation datasets
+are assembled in memory, so the audit pool is not duplicated into one CSV per budget.
 
 ## Metrics
 
@@ -122,11 +133,20 @@ The corresponding plots use metrics such as suppressor AUPRC, Spearman, and RMSE
 `phase2_optimizer_metrics.csv` is the exploitation readout. For each measured-row budget,
 acquisition strategy, model, and optimizer, it records what the optimizer finds when it
 walks the surrogate landscape, then validates the top-k recommendations with the
-simulator. Rows with `search_source = simulator` are the direct truth-walk baseline for
-the same optimizer. The key columns are `best_validated_biomass`,
+simulator. Rows with `search_source = simulator` are the direct noisy-measurement baseline
+for the same optimizer. The key columns are `best_validated_biomass`,
 `mean_validated_biomass`, `best_search_score`, and `optimizer_evaluated_count`. This is
 not a measured-prefix statistic: it asks when a trained surrogate becomes good enough for
 a search algorithm to find low-biomass communities.
+
+Training rows retain configured assay noise. At each measured-row budget, direct simulator
+search receives the same number of noisy community measurements: every distinct community
+an optimizer scores consumes one measurement, including every neighbor considered by a
+greedy step. Repeated queries use the cached observation and are free. The optimizer ranks
+its recommendations by those noisy observations; only its final top-k recommendations are
+validated with the assay-noise scale fixed to zero. `optimizer_evaluated_count` therefore
+equals `measured_count` for direct rows, while surrogate rows report computational model
+evaluations and are not measurement-budget limited.
 
 The calibrated assay-noise layer can apply a higher-order partner-count correction, but
 the simulated scaling benchmark defaults `--partner-count-effect-scale` to `0.0`. This
@@ -139,12 +159,19 @@ latent GLV biomass is mapped onto the real target scale. The default `1.0` prese
 calibrated lab-like noise. Use `0.0` for ideal deterministic labels when the question is
 how well models recover the simulator without measurement noise.
 
-`--target-scale-mapping latent` keeps simulated target biomass on the GLV scale instead
-of z-score mapping it to real-world pathogen signal. This avoids the artificial
-real-scale extinction floor and should be preferred when diagnosing whether the simulator
-itself has too many target-extinction outcomes.
+`--target-scale-mapping quantile` is preferred for noisy assay-like scaling runs. It maps
+latent GLV biomass ranks onto the empirical real-world pathogen-signal distribution
+before replicate noise is applied, avoiding absolute noise-scale mismatch between GLV
+units and assay units. The mapping reference comes from an independent max-species
+calibration landscape and is shared across every species-count prefix and seed. The
+audit distribution therefore remains hidden and species-count shifts are not separately
+normalized away.
+`latent` keeps simulated target biomass on the GLV scale and is preferred for noiseless
+diagnostics of the simulator itself.
+Values outside the calibration distribution are extrapolated rather than clamped to the
+real-data sample extrema, avoiding an artificial shared best-biomass floor.
 Latent targets use raw fold suppressor thresholds (`median / suppressor_fold`) for audit
-metrics; z-score/log targets use log-fold thresholds (`median - log(suppressor_fold)`).
+metrics; real-scale targets use log-fold thresholds (`median - log(suppressor_fold)`).
 
 `--interaction-generator hierarchical` uses the trait-structured generator from the
 simulation domain. It should be evaluated alongside the legacy generator rather than
@@ -173,11 +200,16 @@ composition-diverse sampling, and model-guided active learning such as Bayesian
 optimization or uncertainty/disagreement sampling. A strategy in this phase must answer:
 given measured communities so far, which batch should be measured next?
 
+`random` samples uniformly over all available communities, so partner counts appear in
+proportion to their combinatorial abundance. `size_balanced` is the explicit alternative
+that allocates approximately equal rows across requested partner counts.
+
 Phase 2 is landscape exploitation. Once a surrogate reaches an empirical quality
 threshold, optimizers can walk the surrogate-predicted landscape cheaply. The optimizer's
 recommended final communities are then validated by the simulator and compared to the
-same optimizer walking true simulator scores directly. This phase answers: which model
-plus optimizer combination gets close to the direct simulator-walk baseline?
+same optimizer spending an equal budget on noisy simulator measurements directly. This
+phase answers: which model plus optimizer combination gets close to direct search using
+the same experimental budget?
 
 The headline Phase 2 endpoint is validated recommendation quality, not only abstract
 audit-set model fit. For each measured-row budget `n`, train the surrogate on the
@@ -195,9 +227,9 @@ model-quality metrics, but they should not be the sole endpoint because they can
 and threshold-dependent.
 
 Sequential oracle optimizers such as greedy local search, simulated annealing, and genetic
-algorithms are not lab-realistic acquisition strategies when they query true biomass one
-community at a time. They belong in Phase 2 unless explicitly rewritten as batch proposal
-methods that do not use unmeasured true biomass during proposal.
+algorithms are retained only as measurement-budgeted direct-search baselines. A neighbor,
+offspring, or proposal must be measured before its score can guide the next move. They are
+not treated as batch-realistic Phase 1 acquisition strategies.
 
 ## Threshold Policy
 
@@ -242,6 +274,10 @@ The benchmark includes composition-only exploration strategies:
 It also includes model-based Bayesian optimization:
 
 - `bayesian_optimization`
+
+This strategy fits the shared Gaussian-process surrogate and selects each batch by
+Expected Improvement for minimization. It refits on every accumulated measured batch;
+it is not a lowest-predicted-ridge shortcut.
 
 The following optimizers are used in Phase 2 to walk the trained surrogate landscape, then
 validate their final top-k recommendations with the simulator:

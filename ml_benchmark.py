@@ -113,13 +113,12 @@ def add_pairwise_features(
     return np.column_stack(feature_blocks), feature_names
 
 
-def load_dataset(
-    summary_path: str,
+def dataset_from_summary(
+    summary: pd.DataFrame,
     target_species: str | None,
     species_ids: list[str] | None,
 ) -> TargetBiomassDataset:
-    """Load target-species simulation summaries into model-ready arrays."""
-    summary = pd.read_csv(summary_path)
+    """Convert target-species simulation summaries into model-ready arrays."""
     # Parse communities once, then derive the fixed partner features
     target_species = infer_target_species(summary, target_species)
     communities = summary["community"].astype(str).tolist()
@@ -178,6 +177,15 @@ def load_dataset(
         partner_counts=partner_counts,
         target_se=target_se,
     )
+
+
+def load_dataset(
+    summary_path: str,
+    target_species: str | None,
+    species_ids: list[str] | None,
+) -> TargetBiomassDataset:
+    """Load target-species simulation summaries into model-ready arrays."""
+    return dataset_from_summary(pd.read_csv(summary_path), target_species, species_ids)
 
 
 def split_dataset(dataset: TargetBiomassDataset, test_size: float, seed: int) -> SplitDataset:
@@ -635,8 +643,8 @@ def ridge_pairwise_coefficient_rows(
     y_train = dataset.target_biomass[train_indices]
     # Learn a linear approximation from community features to target biomass.
     model.fit(x_train, y_train)
-    # Extract ridge coefficients after fitting the sklearn pipeline.
-    ridge = model.named_steps["ridge"]
+    # build_regressor returns a bare Ridge
+    ridge = model
 
     rows = [{
         "seed": seed,

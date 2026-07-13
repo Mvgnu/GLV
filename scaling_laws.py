@@ -15,6 +15,7 @@ from ml_benchmark import (
     run_benchmarks,
     write_csv,
 )
+from scaling_law_fits import crossing_bracket
 
 
 def parse_csv_ints(value: str) -> list[int]:
@@ -25,13 +26,39 @@ def parse_csv_floats(value: str) -> list[float]:
     return [float(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def log_train_sizes(rows: int, minimum: int = 4, ratio: float = 2.0 ** 0.5) -> list[int | str]:
+    """Geometric row budgets, so every universe size is resolved proportionally.
+
+    A fraction grid spaces checkpoints by `rows`, which at k=11 puts the first
+    checkpoint at 102 measurements -- already past the requirement it is meant to
+    locate. Geometric spacing keeps the relative step constant instead, so the
+    bracket around `n_tau` is a fixed ratio wide at every `k`.
+    """
+    sizes: list[int | str] = []
+    value = float(minimum)
+    while True:
+        size = int(round(value))
+        if size >= rows:
+            break
+        if not sizes or size > sizes[-1]:
+            sizes.append(size)
+        value *= ratio
+    # "all" resolves to every training row the split leaves available.
+    sizes.append("all")
+    return sizes
+
+
 def train_sizes_for_universe(
     rows: int,
     train_sizes: list[int | str] | None,
     train_fractions: list[float],
+    train_grid: str,
+    minimum_rows: int,
 ) -> list[int | str]:
     if train_sizes is not None:
         return train_sizes
+    if train_grid == "log":
+        return log_train_sizes(rows, minimum_rows)
 
     sizes: list[int | str] = []
     for fraction in train_fractions:
@@ -113,12 +140,10 @@ def load_metric_outputs(
     rows: int,
 ) -> list[dict[str, object]]:
     classification = pd.read_csv(report_dir / "target_suppressor_classification.csv")
-    suppressor_metrics = [
-        "suppressor_precision",
-        "suppressor_class_recall",
-        "suppressor_auprc",
-    ]
-    classification[suppressor_metrics] = classification[suppressor_metrics].fillna(0.0)
+    # A suppressor metric is undefined, not zero, when the held-out split holds no
+    # true suppressor. Filling 0.0 makes an unmeasurable universe look like a model
+    # that measured everything and failed, and those universes cluster at small k.
+    # Leave the NaN so downstream threshold rules and fits can tell the two apart.
     biomass = pd.read_csv(report_dir / "target_biomass_metrics.csv")
     merged = classification.merge(
         biomass[["model", "feature_set", "train_rows", "rmse", "spearman"]],
@@ -148,41 +173,54 @@ def required_row_summary(
     recall_threshold: float,
     auprc_threshold: float,
 ) -> pd.DataFrame:
+    """Bracket the budget at which each universe reaches each threshold.
+
+    A universe that never reaches the threshold is right-censored at its largest
+    budget, not missing. Reporting only the universes that crossed averages over the
+    survivors and understates the requirement wherever crossing is hard, which is
+    exactly where the requirement is largest. Both bounds and the censoring flag are
+    written so `scaling_law_fits.py` can fit the censored likelihood; the plots that
+    read `*_required_rows` remain descriptive and drop censored universes.
+
+    `test_rows` and `true_suppressor_count` travel with each row because a suppressor
+    metric is undefined when the split holds no true suppressor, and that must not be
+    confused with a genuine failure.
+
+    Averaging `*_required_fraction` across universes is not the same as the fraction
+    at which the mean learning curve crosses the threshold. One unlearnable retained
+    species set can hold the mean curve below `tau` at every budget while most
+    universes cross early.
+    """
+    thresholds = {
+        "precision": ("suppressor_precision", precision_threshold),
+        "recall": ("suppressor_class_recall", recall_threshold),
+        "auprc": ("suppressor_auprc", auprc_threshold),
+    }
     rows = []
     group_columns = ["species_count", "model", "feature_set", "universe_seed"]
     for group_values, group in metrics.groupby(group_columns, sort=False):
         group = group.sort_values("train_rows")
-        precision_hit = group[group["suppressor_precision"] >= precision_threshold]
-        recall_hit = group[group["suppressor_class_recall"] >= recall_threshold]
-        auprc_hit = group[group["suppressor_auprc"] >= auprc_threshold]
+        budgets = group["train_rows"].to_numpy(dtype=float)
+        universe_rows = int(group["rows"].iloc[0])
         base = {
             column: value
             for column, value in zip(group_columns, group_values, strict=True)
         }
-        base["rows"] = int(group["rows"].iloc[0])
-        if precision_hit.empty:
-            base["precision_required_rows"] = np.nan
-            base["precision_required_fraction"] = np.nan
-        else:
-            base["precision_required_rows"] = int(precision_hit["train_rows"].iloc[0])
-            base["precision_required_fraction"] = float(
-                precision_hit["measured_fraction"].iloc[0]
-            )
-        if auprc_hit.empty:
-            base["auprc_required_rows"] = np.nan
-            base["auprc_required_fraction"] = np.nan
-        else:
-            base["auprc_required_rows"] = int(auprc_hit["train_rows"].iloc[0])
-            base["auprc_required_fraction"] = float(
-                auprc_hit["measured_fraction"].iloc[0]
-            )
-        if recall_hit.empty:
-            base["recall_required_rows"] = np.nan
-            base["recall_required_fraction"] = np.nan
-        else:
-            base["recall_required_rows"] = int(recall_hit["train_rows"].iloc[0])
-            base["recall_required_fraction"] = float(
-                recall_hit["measured_fraction"].iloc[0]
+        base["rows"] = universe_rows
+        base["max_budget"] = float(budgets[-1])
+        base["test_rows"] = float(group["test_rows"].iloc[0])
+        base["true_suppressor_count"] = float(group["true_suppressor_count"].max())
+
+        for prefix, (column, threshold) in thresholds.items():
+            values = group[column].to_numpy(dtype=float)
+            lower, upper = crossing_bracket(budgets, values, threshold)
+            censored = bool(np.isinf(upper))
+            base[f"{prefix}_threshold"] = float(threshold)
+            base[f"{prefix}_censored"] = censored
+            base[f"{prefix}_lower_rows"] = float(lower)
+            base[f"{prefix}_required_rows"] = np.nan if censored else float(upper)
+            base[f"{prefix}_required_fraction"] = (
+                np.nan if censored else float(upper) / universe_rows
             )
         rows.append(base)
 
@@ -450,6 +488,8 @@ def run_scaling_laws(
     repeat_count: int,
     train_sizes: list[int | str] | None,
     train_fractions: list[float],
+    train_grid: str,
+    minimum_train_rows: int,
     models: list[str] | None,
     suppressor_fold: float,
     precision_threshold: float,
@@ -506,6 +546,8 @@ def run_scaling_laws(
                     len(universe_summary),
                     train_sizes,
                     train_fractions,
+                    train_grid,
+                    minimum_train_rows,
                 ),
                 suppressor_fold=suppressor_fold,
                 buffer_z=1.96,
@@ -721,18 +763,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="GLV_ML/outputs/benchmarks/scaling_laws_real")
     parser.add_argument("--target-species")
     parser.add_argument("--species-ids")
-    parser.add_argument("--species-counts", default="3,4,5,6,7,8,9,10,11")
+    # k=3 and k=4 are omitted by default: the suppressor cutoff sits 2-fold below each
+    # universe's own median, and universes that small hold almost no such community
+    # (prevalence 2.9% and 4.0%), so every suppressor metric there is undefined.
+    parser.add_argument("--species-counts", default="5,6,7,8,9,10,11")
     parser.add_argument("--universes-per-size", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--repeat-count", type=int, default=3)
     parser.add_argument(
         "--train-sizes",
-        help="Optional comma-separated row-count budgets. Overrides --train-fractions.",
+        help="Optional comma-separated row-count budgets. Overrides --train-grid.",
+    )
+    parser.add_argument(
+        "--train-grid",
+        default="log",
+        choices=("log", "fraction"),
+        help=(
+            "log: geometric row budgets, constant relative resolution at every k. "
+            "fraction: the --train-fractions grid, which is coarse at large k."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-train-rows",
+        type=int,
+        default=4,
+        help="Smallest budget in the log grid.",
     )
     parser.add_argument(
         "--train-fractions",
         default="0.05,0.10,0.15,0.20,0.25,0.30,0.40,0.50,0.75,1.0",
-        help="Comma-separated measured-fraction budgets converted to row counts per universe.",
+        help="Measured-fraction budgets, used only when --train-grid fraction.",
     )
     parser.add_argument(
         "--models", default="ridge_pairwise,random_forest,hist_gradient_boosting"
@@ -757,6 +817,8 @@ def main() -> None:
         repeat_count=args.repeat_count,
         train_sizes=parse_train_sizes(args.train_sizes) if args.train_sizes else None,
         train_fractions=parse_csv_floats(args.train_fractions),
+        train_grid=args.train_grid,
+        minimum_train_rows=args.minimum_train_rows,
         models=parse_model_names(args.models),
         suppressor_fold=args.suppressor_fold,
         precision_threshold=args.precision_threshold,

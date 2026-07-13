@@ -3,9 +3,11 @@ name: ml
 description: "Model benchmarks over simulated GLV community summary outputs"
 paths:
   service: GLV_ML/ml_benchmark.py
+  tests: GLV_ML/tests/test_simulated_landscape_scaling.py
   transform_comparison: GLV_ML/compare_target_transforms.py
   reports: GLV_ML/outputs/benchmarks/ml/
 exports:
+  - dataset_from_summary
   - target_biomass_metrics.csv
   - target_biomass_split_metrics.csv
   - target_biomass_skill_vs_baseline.csv
@@ -23,6 +25,7 @@ consumes:
   - simulation.summary_stats.csv
 verification:
   syntax: ".venv/bin/python -m py_compile GLV_ML/ml_benchmark.py GLV_ML/compare_target_transforms.py"
+  tests: ".venv/bin/python -m unittest discover -s GLV_ML/tests -v"
   smoke: ".venv/bin/python GLV_ML/ml_benchmark.py GLV_ML/outputs/simulation/exhaustive/outputs_target_12_species_bounded/all_summary_stats.csv --target-species sp_012 --output-dir GLV_ML/outputs/benchmarks/ml_smoke"
 ---
 

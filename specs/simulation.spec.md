@@ -3,6 +3,7 @@ name: simulation
 description: "GLV dataset generation, community simulation, stop classification, and plots"
 paths:
   service: GLV_ML/lotka_volterra.py
+  tests: GLV_ML/tests/test_simulated_landscape_scaling.py
   examples: GLV_ML/species_interactions_example.csv
   outputs: GLV_ML/outputs/simulation/
 exports:
@@ -14,6 +15,7 @@ exports:
 consumes: []
 verification:
   syntax: ".venv/bin/python -m py_compile GLV_ML/lotka_volterra.py"
+  tests: ".venv/bin/python -m unittest discover -s GLV_ML/tests -v"
 ---
 
 # Simulation Domain
@@ -56,7 +58,9 @@ Production simulated-landscape runs use the integrated `saturating` endpoint, wh
 species receives a signed, row-total off-diagonal pressure passed through
 `saturation_pressure * tanh(raw_pressure / saturation_pressure)`. This applies to all
 species, not only the target, and is intended to create graded suppressor landscapes
-without arbitrary target-only rescue terms.
+without arbitrary target-only rescue terms. The endpoint stops when RMS derivative falls
+below `1e-6`, rather than integrating already-settled communities to the configured
+maximum time. Diagonal and off-diagonal matrices are prepared once per integration.
 
 Generated GLV inputs may also use empirical target-effect priors from
 `simulation_assay_noise.interaction_effect_prior.csv`. `--effect-prior-csv` applies

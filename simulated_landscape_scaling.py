@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,21 +21,23 @@ from calibrate_simulation_rates import (
     add_assay_observations,
 )
 from active_learning import (
+    bayesian_optimization_statistics,
     train_model as train_active_model,
 )
 from lotka_volterra import generate_interaction_data, saturating_endpoint
 from ml_benchmark import (
-    GLVIdentityGNNRegressor,
     add_pairwise_features,
-    build_regressor,
-    load_dataset,
+    dataset_from_summary,
     model_configs,
-    model_features,
     parse_model_names,
     regression_metrics,
     suppressor_classification_metrics,
     write_csv,
 )
+from simulation_assay_noise import AssayNoiseModel, fit_assay_noise_model
+
+
+MAPPING_CALIBRATION_SIZE = 500
 
 
 @dataclass(frozen=True)
@@ -95,8 +98,8 @@ def sample_partner_groups(
     excluded = excluded or set()
     groups: list[tuple[str, ...]] = []
     seen = set(excluded)
-    # Dict path: exact rows per partner count. List path: count total rows randomly
-    # spread across allowed partner counts, capped by the remaining possible groups.
+    # Dict path requests exact rows per size. List path samples uniformly from all
+    # remaining communities, so sizes are weighted by their combination counts.
     if isinstance(partner_count_request, dict):
         rows_by_partner_count = partner_count_request
     else:
@@ -115,7 +118,11 @@ def sample_partner_groups(
                 for partner_count, available in available_by_partner_count.items()
                 if rows_by_partner_count[partner_count] < available
             ]
-            partner_count = int(rng.choice(available_counts))
+            remaining = np.array([
+                available_by_partner_count[partner_count] - rows_by_partner_count[partner_count]
+                for partner_count in available_counts
+            ], dtype=float)
+            partner_count = int(rng.choice(available_counts, p=remaining / remaining.sum()))
             rows_by_partner_count[partner_count] += 1
 
     for partner_count, requested_rows in sorted(rows_by_partner_count.items()):
@@ -193,7 +200,8 @@ def simulate_communities(
 
 def add_observed_targets(
     latent_summary: pd.DataFrame,
-    real_summary_path: str | None,
+    real_summary: pd.DataFrame | None,
+    noise_model: AssayNoiseModel | None,
     suppressor_fold: float,
     partner_count_effect_scale: float,
     partner_count_effect_center: float,
@@ -201,8 +209,9 @@ def add_observed_targets(
     assay_noise_scale: float,
     target_scale_mapping: str,
     seed: int,
+    mapping_reference_values: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    if not real_summary_path:
+    if real_summary is None:
         summary = latent_summary.copy()
         summary["final_target_biomass"] = summary["latent_target_biomass"]
         summary["pathogen_signal_std"] = 0.0
@@ -210,7 +219,6 @@ def add_observed_targets(
         summary["target_transform"] = "latent"
         return summary
 
-    real_summary = pd.read_csv(real_summary_path)
     return add_assay_observations(
         latent_summary,
         real_summary,
@@ -221,6 +229,8 @@ def add_observed_targets(
         seed,
         assay_noise_scale,
         target_scale_mapping,
+        mapping_reference_values,
+        noise_model,
     )
 
 
@@ -279,18 +289,17 @@ def max_diversity_explore_groups(
     if not candidates:
         return []
     presence = presence_from_groups(candidates, partners)
-    remaining = list(range(len(candidates)))
-    order = [remaining.pop(int(rng.integers(len(remaining))))]
-    while remaining:
-        selected_presence = presence[np.array(order, dtype=int)]
-        best_position = 0
-        best_distance = -1.0
-        for position, candidate in enumerate(remaining):
-            min_distance = float(np.abs(selected_presence - presence[candidate]).sum(axis=1).min())
-            if min_distance > best_distance:
-                best_distance = min_distance
-                best_position = position
-        order.append(remaining.pop(best_position))
+    first = int(rng.integers(len(candidates)))
+    order = [first]
+    min_distances = np.abs(presence - presence[first]).sum(axis=1).astype(float)
+    min_distances[first] = -1.0
+    while len(order) < min(budget, len(candidates)):
+        next_position = int(np.argmax(min_distances))
+        order.append(next_position)
+        # Only the newly selected row can lower each candidate's nearest distance.
+        distances = np.abs(presence - presence[next_position]).sum(axis=1)
+        min_distances = np.minimum(min_distances, distances)
+        min_distances[np.array(order, dtype=int)] = -1.0
     return [candidates[position] for position in order[:budget]]
 
 
@@ -358,7 +367,8 @@ def simulate_partner_groups(
     saturation_pressure: float,
     endpoint_initial_density: float,
     endpoint_max_time: float,
-    real_summary_path: str | None,
+    real_summary: pd.DataFrame | None,
+    noise_model: AssayNoiseModel | None,
     suppressor_fold: float,
     partner_count_effect_scale: float,
     partner_count_effect_center: float,
@@ -366,6 +376,7 @@ def simulate_partner_groups(
     assay_noise_scale: float,
     target_scale_mapping: str,
     seed: int,
+    mapping_reference_values: np.ndarray | None = None,
 ) -> pd.DataFrame:
     communities = [tuple(sorted((*group, target_species))) for group in partner_groups]
     latent = simulate_communities(
@@ -380,7 +391,8 @@ def simulate_partner_groups(
     )
     return add_observed_targets(
         latent,
-        real_summary_path,
+        real_summary,
+        noise_model,
         suppressor_fold,
         partner_count_effect_scale,
         partner_count_effect_center,
@@ -388,6 +400,7 @@ def simulate_partner_groups(
         assay_noise_scale,
         target_scale_mapping,
         seed,
+        mapping_reference_values,
     )
 
 
@@ -422,52 +435,29 @@ class LazyCommunityEvaluator:
         self.target_species = target_species
         self.simulation_kwargs = simulation_kwargs
         self.seed = seed
-        self.cache: dict[tuple[str, ...], pd.DataFrame] = {}
+        self.cache: dict[tuple[str, ...], dict[str, object]] = {}
 
     def measure(self, group: tuple[str, ...]) -> float:
         if group not in self.cache:
-            self.cache[group] = simulate_partner_groups(
+            summary = simulate_partner_groups(
                 self.interaction_data,
                 [group],
                 seed=stable_group_seed(self.seed, group),
                 **self.simulation_kwargs,
             )
-        return float(self.cache[group]["final_target_biomass"].iloc[0])
+            self.cache[group] = summary.iloc[0].to_dict()
+        return float(self.cache[group]["final_target_biomass"])
 
     def summary_for(self, groups: list[tuple[str, ...]]) -> pd.DataFrame:
         for group in groups:
             self.measure(group)
-        return pd.concat([self.cache[group] for group in groups], ignore_index=True)
-
-
-def build_evaluation_dataset(
-    measured_summary: pd.DataFrame,
-    audit_summary: pd.DataFrame,
-    path: Path,
-    target_species: str,
-    species_ids: list[str],
-) -> tuple[object, np.ndarray, np.ndarray, pd.DataFrame]:
-    measured = measured_summary.copy()
-    audit = audit_summary.copy()
-    measured["pool"] = "measured"
-    audit["pool"] = "audit"
-    if path.exists():
-        evaluation_summary = pd.read_csv(path)
-    else:
-        evaluation_summary = pd.concat([measured, audit], ignore_index=True)
-        evaluation_summary.to_csv(path, index=False)
-    dataset = load_dataset(str(path), target_species, species_ids)
-    measured_indices = np.flatnonzero(evaluation_summary["pool"].eq("measured").to_numpy())
-    audit_indices = np.flatnonzero(evaluation_summary["pool"].eq("audit").to_numpy())
-    return dataset, measured_indices, audit_indices, evaluation_summary
+        return pd.DataFrame([self.cache[group] for group in groups])
 
 
 def bayesian_iterative_groups(
     partners: list[str],
     partner_counts: list[int],
     evaluator: LazyCommunityEvaluator,
-    audit_summary: pd.DataFrame,
-    workspace_path: Path,
     target_species: str,
     species_ids: list[str],
     seed: int,
@@ -491,20 +481,6 @@ def bayesian_iterative_groups(
 
     while len(measured_groups) < budget:
         measured_summary = evaluator.summary_for(measured_groups)
-        dataset, measured_indices, _audit_indices, _evaluation_summary = build_evaluation_dataset(
-            measured_summary,
-            audit_summary,
-            workspace_path,
-            target_species,
-            species_ids,
-        )
-        model, _features = train_active_model(
-            dataset,
-            "ridge_pairwise",
-            "pairwise",
-            measured_indices,
-            seed + len(measured_groups),
-        )
         candidate_groups = sample_partner_groups(
             partners,
             partner_counts,
@@ -515,11 +491,28 @@ def bayesian_iterative_groups(
         if not candidate_groups:
             break
 
-        candidate_presence = presence_from_groups(candidate_groups, partners).astype(float)
-        candidate_features, _feature_names = add_pairwise_features(candidate_presence, partners)
-        predictions = model.predict(candidate_features)
+        candidate_summary = pd.DataFrame({
+            "community": [
+                ";".join(sorted((*group, target_species)))
+                for group in candidate_groups
+            ],
+            "partner_count": [len(group) for group in candidate_groups],
+            "target_species": target_species,
+            "final_target_biomass": 0.0,
+        })
+        acquisition_summary = pd.concat(
+            [measured_summary, candidate_summary],
+            ignore_index=True,
+        )
+        dataset = dataset_from_summary(acquisition_summary, target_species, species_ids)
+        measured_indices = np.arange(len(measured_summary), dtype=int)
+        _mean, _uncertainty, acquisition_scores = bayesian_optimization_statistics(
+            dataset,
+            measured_indices,
+            seed + len(measured_groups),
+        )
         take = min(batch_size, budget - len(measured_groups), len(candidate_groups))
-        order = np.argsort(predictions)[:take]
+        order = np.argsort(acquisition_scores[len(measured_summary):])[:take]
         for position in order:
             group = candidate_groups[int(position)]
             measured_groups.append(group)
@@ -538,31 +531,6 @@ def bayesian_iterative_groups(
     return measured_groups[:budget]
 
 
-def features_for_partner_groups(
-    groups: list[tuple[str, ...]],
-    partners: list[str],
-    feature_set: str,
-) -> np.ndarray:
-    presence = presence_from_groups(groups, partners).astype(float)
-    if feature_set == "pairwise":
-        features, _feature_names = add_pairwise_features(presence, partners)
-        return features
-    return presence
-
-
-def fit_model(dataset, model_name: str, feature_set: str, train_indices: np.ndarray, seed: int):
-    features = model_features(dataset, feature_set)
-    if model_name == "gnn":
-        model = GLVIdentityGNNRegressor(
-            partner_count=len(dataset.partner_ids),
-            seed=seed,
-        )
-    else:
-        model = build_regressor(model_name, seed)
-    model.fit(features[train_indices], dataset.target_biomass[train_indices])
-    return model, features
-
-
 def run_phase2_optimizer(
     optimizer: str,
     score_groups,
@@ -571,65 +539,99 @@ def run_phase2_optimizer(
     seed: int,
     top_k: int,
     proposal_candidate_size: int,
+    measurement_budget: int | None = None,
 ) -> tuple[list[tuple[str, ...]], np.ndarray, int]:
-    """Walk a simulator or surrogate landscape and return the top recommendations."""
+    """Walk a simulator or surrogate landscape and return the top recommendations.
+
+    A direct simulator walk may set ``measurement_budget``. Each distinct community
+    scored then consumes one measurement; cached repeats are free. Surrogate walks leave
+    it unset because evaluating another model prediction has no laboratory cost.
+    """
     rng = np.random.default_rng(seed)
-    candidates = sample_partner_groups(
-        partners,
-        partner_counts,
-        rng,
-        set(),
-        count=max(proposal_candidate_size, top_k),
-    )
+    scores_by_group: dict[tuple[str, ...], float] = {}
+
+    def budget_exhausted() -> bool:
+        return measurement_budget is not None and len(scores_by_group) >= measurement_budget
+
+    def evaluate(groups: list[tuple[str, ...]]) -> np.ndarray:
+        missing = list(dict.fromkeys(
+            group for group in groups if group not in scores_by_group
+        ))
+        if measurement_budget is not None:
+            remaining = measurement_budget - len(scores_by_group)
+            missing = missing[:remaining]
+        if missing:
+            scores = score_groups(missing)
+            for group, score in zip(missing, scores, strict=True):
+                scores_by_group[group] = float(score)
+        return np.array([scores_by_group.get(group, np.inf) for group in groups], dtype=float)
 
     if optimizer == "predicted_best":
-        score_groups(candidates)
-    elif optimizer == "greedy_forward":
-        # All neighbors are evaluated at each move; caps only bound starts and walk length.
-        starts = sample_partner_groups(
+        candidates = sample_partner_groups(
             partners,
             partner_counts,
             rng,
             set(),
-            count=min(32, max(1, proposal_candidate_size // 20)),
+            count=max(proposal_candidate_size, top_k),
         )
-        candidates.extend(starts)
+        evaluate(candidates)
+    elif optimizer == "greedy_forward":
+        # Start at the smallest requested size, then only add partners while improving.
+        minimum_size = min(partner_counts)
+        start_count = 32 if measurement_budget is None else measurement_budget
+        starts = sample_partner_groups(
+            partners,
+            {minimum_size: min(start_count, math.comb(len(partners), minimum_size))},
+            rng,
+            set(),
+        )
         for start in starts:
+            if budget_exhausted():
+                break
             current = start
-            current_score = float(score_groups([current])[0])
-            for _step in range(40):
-                neighbors = valid_neighbor_groups(current, partners, partner_counts)
+            current_score = float(evaluate([current])[0])
+            while len(current) < max(partner_counts) and not budget_exhausted():
+                neighbors = [
+                    tuple(sorted((*current, partner)))
+                    for partner in partners
+                    if partner not in current and len(current) + 1 in partner_counts
+                ]
                 if not neighbors:
                     break
-                scores = score_groups(neighbors)
+                rng.shuffle(neighbors)
+                scores = evaluate(neighbors)
                 best_index = int(np.argmin(scores))
                 best_score = float(scores[best_index])
-                candidates.append(neighbors[best_index])
                 if best_score >= current_score:
                     break
                 current = neighbors[best_index]
                 current_score = best_score
     elif optimizer == "simulated_annealing":
         # The neighbor set is complete; annealing samples one neighbor per bounded step.
+        start_count = 12
+        if measurement_budget is not None:
+            start_count = max(12, math.ceil(measurement_budget / 120))
         starts = sample_partner_groups(
             partners,
             partner_counts,
             rng,
             set(),
-            count=12,
+            count=start_count,
         )
-        candidates.extend(starts)
         for start in starts:
+            if budget_exhausted():
+                break
             current = start
-            current_score = float(score_groups([current])[0])
-            temperature = 0.5
+            current_score = float(evaluate([current])[0])
+            temperature = max(abs(current_score) * 0.1, 1e-3)
             for _step in range(120):
+                if budget_exhausted():
+                    break
                 neighbors = valid_neighbor_groups(current, partners, partner_counts)
                 if not neighbors:
                     break
                 proposal = neighbors[int(rng.integers(len(neighbors)))]
-                proposal_score = float(score_groups([proposal])[0])
-                candidates.append(proposal)
+                proposal_score = float(evaluate([proposal])[0])
                 delta = proposal_score - current_score
                 if delta < 0 or rng.random() < np.exp(-delta / max(temperature, 1e-12)):
                     current = proposal
@@ -638,12 +640,17 @@ def run_phase2_optimizer(
     elif optimizer == "genetic_algorithm":
         # Population and generation counts cap compute, not the per-community neighbor set.
         population = sample_partner_groups(partners, partner_counts, rng, set(), count=48)
-        candidates.extend(population)
-        for _generation in range(60):
-            scores = score_groups(population)
-            elite_indices = np.argsort(scores)[:8]
+        population_size = len(population)
+        generation_count = 60
+        if measurement_budget is not None:
+            generation_count = max(60, 2 * math.ceil(measurement_budget / population_size))
+        for _generation in range(generation_count):
+            if budget_exhausted():
+                break
+            scores = evaluate(population)
+            elite_indices = np.argsort(scores)[:min(8, population_size)]
             offspring = [population[int(index)] for index in elite_indices]
-            while len(offspring) < 48:
+            while len(offspring) < population_size:
                 parent_a = population[int(rng.integers(len(population)))]
                 parent_b = population[int(rng.integers(len(population)))]
                 child = [partner for partner in sorted(set(parent_a) | set(parent_b)) if rng.random() < 0.5]
@@ -666,15 +673,25 @@ def run_phase2_optimizer(
                         group = replacement[0]
                 offspring.append(group)
             population = offspring
-            candidates.extend(population)
+        evaluate(population)
     else:
         raise ValueError(f"Unknown phase2 optimizer: {optimizer}")
 
-    unique_candidates = sorted(set(candidates))
-    scores = score_groups(unique_candidates)
+    # Random restarts spend any budget left after a walk stalls or exhausts its local moves.
+    if measurement_budget is not None and not budget_exhausted():
+        evaluate(sample_partner_groups(
+            partners,
+            partner_counts,
+            rng,
+            set(scores_by_group),
+            count=measurement_budget - len(scores_by_group),
+        ))
+
+    evaluated_groups = list(scores_by_group)
+    scores = np.array([scores_by_group[group] for group in evaluated_groups], dtype=float)
     order = np.argsort(scores)[:top_k]
-    recommendations = [unique_candidates[int(index)] for index in order]
-    return recommendations, scores[order], len(unique_candidates)
+    recommendations = [evaluated_groups[int(index)] for index in order]
+    return recommendations, scores[order], len(evaluated_groups)
 
 
 def bounded_metric_limits(metric: str) -> tuple[float, float] | None:
@@ -1211,8 +1228,10 @@ def plot_phase2_optimizer_metric(
 
     for species_count in sorted(plot_data["species_count"].unique()):
         species_data = plot_data[plot_data["species_count"].eq(species_count)]
-        models = sorted(species_data["model"].unique())
-        strategies = sorted(species_data["strategy"].unique())
+        surrogate_data = species_data[species_data["search_source"].eq("surrogate")]
+        baseline_data = species_data[species_data["search_source"].eq("simulator")]
+        models = sorted(surrogate_data["model"].unique())
+        strategies = sorted(surrogate_data["strategy"].unique())
         fig, axes = plt.subplots(
             len(models),
             len(strategies),
@@ -1229,9 +1248,9 @@ def plot_phase2_optimizer_metric(
         for row_index, model_name in enumerate(models):
             for column_index, strategy in enumerate(strategies):
                 ax = axes[row_index, column_index]
-                panel_data = species_data[
-                    species_data["model"].eq(model_name)
-                    & species_data["strategy"].eq(strategy)
+                panel_data = surrogate_data[
+                    surrogate_data["model"].eq(model_name)
+                    & surrogate_data["strategy"].eq(strategy)
                 ]
                 grouped = panel_data.groupby(
                     ["optimizer", "measured_count"],
@@ -1244,6 +1263,16 @@ def plot_phase2_optimizer_metric(
                         marker="o",
                         linewidth=1.5,
                         label=str(optimizer),
+                    )
+                for optimizer, baseline_group in baseline_data.groupby("optimizer", sort=True):
+                    baseline_group = baseline_group.sort_values("measured_count")
+                    ax.plot(
+                        baseline_group["measured_count"],
+                        baseline_group["mean"],
+                        linewidth=1.0,
+                        linestyle="--",
+                        alpha=0.7,
+                        label=f"{optimizer} direct",
                     )
                 if row_index == 0:
                     ax.set_title(strategy)
@@ -1306,18 +1335,170 @@ def run_simulated_scaling(
     buffer_z: float,
     extinction_threshold: float,
 ) -> tuple[Path, Path, Path]:
+    if real_summary_path is None and target_scale_mapping != "latent":
+        raise ValueError("--real-summary is required for zscore or quantile target mapping")
+    model_setup = model_configs(models)
+    real_summary = pd.read_csv(real_summary_path) if real_summary_path else None
+    noise_model = fit_assay_noise_model(real_summary)[0] if real_summary is not None else None
+
     output_path = Path(output_dir)
     inputs_path = output_path / "inputs"
     pools_path = output_path / "pools"
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    input_paths = {}
+    for label, path in {
+        "real_summary": real_summary_path,
+        "effect_prior": effect_prior_csv,
+    }.items():
+        if path:
+            input_paths[label] = str(Path(path).resolve())
+
+    run_config = {
+        "species_counts": species_counts,
+        "partner_counts": partner_counts,
+        "proposal_candidate_size": proposal_candidate_size,
+        "audit_size": audit_size,
+        "audit_fraction": audit_fraction,
+        "budgets": budgets,
+        "batch_size": batch_size,
+        "partner_count_bands": [
+            {"label": band.label, "min_count": band.min_count, "max_count": band.max_count}
+            for band in partner_count_bands
+        ],
+        "phase2_optimizers": phase2_optimizers,
+        "phase2_top_k": phase2_top_k,
+        "seeds": seeds,
+        "base_seed": base_seed,
+        "target_species": target_species,
+        "models": models,
+        "strategies": strategies,
+        "input_paths": input_paths,
+        "interaction_range": interaction_range,
+        "off_diagonal_min": off_diagonal_min,
+        "off_diagonal_max": off_diagonal_max,
+        "growth_rate": growth_rate,
+        "self_interaction": self_interaction,
+        "interaction_generator": interaction_generator,
+        "carrying_capacity_min": carrying_capacity_min,
+        "carrying_capacity_max": carrying_capacity_max,
+        "hierarchy_strength": hierarchy_strength,
+        "hierarchy_noise": hierarchy_noise,
+        "target_interaction_scale": target_interaction_scale,
+        "interaction_response": interaction_response,
+        "saturation_pressure": saturation_pressure,
+        "endpoint_initial_density": endpoint_initial_density,
+        "endpoint_max_time": endpoint_max_time,
+        "target_self_interaction": target_self_interaction,
+        "target_effect_scale": target_effect_scale,
+        "pair_effect_scale": pair_effect_scale,
+        "partner_count_effect_scale": partner_count_effect_scale,
+        "partner_count_effect_center": partner_count_effect_center,
+        "partner_count_effect_width": partner_count_effect_width,
+        "assay_noise_scale": assay_noise_scale,
+        "target_scale_mapping": target_scale_mapping,
+        "suppressor_fold": suppressor_fold,
+        "buffer_z": buffer_z,
+        "extinction_threshold": extinction_threshold,
+        "mapping_calibration_size": MAPPING_CALIBRATION_SIZE,
+    }
+    manifest_path = output_path / "run_config.json"
+    if not manifest_path.exists():
+        manifest_path.write_text(json.dumps(run_config, indent=2, sort_keys=True) + "\n")
+
     inputs_path.mkdir(parents=True, exist_ok=True)
     pools_path.mkdir(parents=True, exist_ok=True)
 
     run_rows = []
     metric_rows = []
     phase2_rows = []
-    model_setup = model_configs(models)
     max_species_count = max(species_counts)
     common_target_species = target_species or f"sp_{min(species_counts):03d}"
+    interaction_generation_kwargs = {
+        "interaction_range": interaction_range,
+        "off_diagonal_min": off_diagonal_min,
+        "off_diagonal_max": off_diagonal_max,
+        "growth_rate": growth_rate,
+        "self_interaction": self_interaction,
+        "target_species": common_target_species,
+        "target_self_interaction": target_self_interaction,
+        "effect_prior_csv": effect_prior_csv,
+        "target_effect_scale": target_effect_scale,
+        "pair_effect_scale": pair_effect_scale,
+        "interaction_generator": interaction_generator,
+        "carrying_capacity_min": carrying_capacity_min,
+        "carrying_capacity_max": carrying_capacity_max,
+        "hierarchy_strength": hierarchy_strength,
+        "hierarchy_noise": hierarchy_noise,
+        "target_interaction_scale": target_interaction_scale,
+    }
+
+    mapping_reference_values = None
+    mapping_calibration_path = None
+    if real_summary is not None and target_scale_mapping != "latent":
+        calibration_seed = base_seed + 1_000_000
+        calibration_interaction_path = (
+            inputs_path
+            / f"mapping_species_{max_species_count}_seed_{calibration_seed}_interactions.csv"
+        )
+        if calibration_interaction_path.exists():
+            calibration_interaction_data = pd.read_csv(calibration_interaction_path)
+        else:
+            calibration_interaction_data = generate_interaction_data(
+                species_count=max_species_count,
+                seed=calibration_seed,
+                **interaction_generation_kwargs,
+            )
+            calibration_interaction_data.to_csv(calibration_interaction_path, index=False)
+
+        calibration_species = [
+            f"sp_{index + 1:03d}" for index in range(max_species_count)
+        ]
+        calibration_partners = [
+            species for species in calibration_species if species != common_target_species
+        ]
+        calibration_partner_counts = [
+            count for count in partner_counts if 0 < count <= len(calibration_partners)
+        ]
+        calibration_group_count = min(
+            MAPPING_CALIBRATION_SIZE,
+            audit_size,
+            sum(
+                math.comb(len(calibration_partners), count)
+                for count in calibration_partner_counts
+            ),
+        )
+        mapping_calibration_path = (
+            inputs_path
+            / f"mapping_species_{max_species_count}_seed_{calibration_seed}_latent.csv"
+        )
+        if mapping_calibration_path.exists():
+            mapping_calibration = pd.read_csv(mapping_calibration_path)
+        else:
+            calibration_groups = sample_partner_groups(
+                calibration_partners,
+                calibration_partner_counts,
+                np.random.default_rng(calibration_seed),
+                count=calibration_group_count,
+            )
+            calibration_communities = [
+                tuple(sorted((*group, common_target_species)))
+                for group in calibration_groups
+            ]
+            mapping_calibration = simulate_communities(
+                calibration_interaction_data,
+                calibration_communities,
+                common_target_species,
+                extinction_threshold,
+                interaction_response,
+                saturation_pressure,
+                endpoint_initial_density,
+                endpoint_max_time,
+            )
+            mapping_calibration.to_csv(mapping_calibration_path, index=False)
+        mapping_reference_values = mapping_calibration[
+            "latent_target_biomass"
+        ].to_numpy(dtype=float)
 
     for seed_index in range(seeds):
         universe_seed = base_seed + seed_index
@@ -1328,23 +1509,8 @@ def run_simulated_scaling(
             # One max-species universe keeps species-count comparisons nested.
             universe_interaction_data = generate_interaction_data(
                 species_count=max_species_count,
-                interaction_range=interaction_range,
-                off_diagonal_min=off_diagonal_min,
-                off_diagonal_max=off_diagonal_max,
-                growth_rate=growth_rate,
-                self_interaction=self_interaction,
-                target_species=common_target_species,
-                target_self_interaction=target_self_interaction,
-                effect_prior_csv=effect_prior_csv,
-                target_effect_scale=target_effect_scale,
-                pair_effect_scale=pair_effect_scale,
                 seed=universe_seed,
-                interaction_generator=interaction_generator,
-                carrying_capacity_min=carrying_capacity_min,
-                carrying_capacity_max=carrying_capacity_max,
-                hierarchy_strength=hierarchy_strength,
-                hierarchy_noise=hierarchy_noise,
-                target_interaction_scale=target_interaction_scale,
+                **interaction_generation_kwargs,
             )
             universe_interaction_data.to_csv(universe_path, index=False)
 
@@ -1377,14 +1543,6 @@ def run_simulated_scaling(
             }
             total_groups = sum(possible_by_count.values())
             audit_target = min(audit_size, max(1, int(total_groups * audit_fraction)))
-            audit_rows_by_count = {}
-            for count, possible_count in possible_by_count.items():
-                rows = min(possible_count, int(audit_target * possible_count / total_groups))
-                if rows > 0:
-                    audit_rows_by_count[count] = rows
-            if not audit_rows_by_count:
-                largest_count = max(possible_by_count, key=possible_by_count.get)
-                audit_rows_by_count[largest_count] = 1
             audit_path = pools_path / f"{run_id}_audit_pool.csv"
             if audit_path.exists():
                 audit_summary = pd.read_csv(audit_path)
@@ -1392,8 +1550,9 @@ def run_simulated_scaling(
             else:
                 audit_groups = sample_partner_groups(
                     partners,
-                    audit_rows_by_count,
+                    valid_partner_counts,
                     rng,
+                    count=audit_target,
                 )
             audit_group_set = set(audit_groups)
             search_space_rows = max(0, total_groups - len(audit_group_set))
@@ -1411,24 +1570,46 @@ def run_simulated_scaling(
                 "saturation_pressure": saturation_pressure,
                 "endpoint_initial_density": endpoint_initial_density,
                 "endpoint_max_time": endpoint_max_time,
-                "real_summary_path": real_summary_path,
+                "real_summary": real_summary,
+                "noise_model": noise_model,
                 "suppressor_fold": suppressor_fold,
                 "partner_count_effect_scale": partner_count_effect_scale,
                 "partner_count_effect_center": partner_count_effect_center,
                 "partner_count_effect_width": partner_count_effect_width,
                 "assay_noise_scale": assay_noise_scale,
                 "target_scale_mapping": target_scale_mapping,
+                "mapping_reference_values": mapping_reference_values,
             }
             if not audit_path.exists():
-                audit_summary = simulate_partner_groups(
+                audit_communities = [tuple(sorted((*group, run_target_species))) for group in audit_groups]
+                audit_latent = simulate_communities(
                     interaction_data,
-                    audit_groups,
-                    seed=run_seed + 29,
-                    **simulation_kwargs,
+                    audit_communities,
+                    run_target_species,
+                    extinction_threshold,
+                    interaction_response,
+                    saturation_pressure,
+                    endpoint_initial_density,
+                    endpoint_max_time,
+                )
+                audit_summary = add_observed_targets(
+                    audit_latent,
+                    real_summary,
+                    noise_model,
+                    suppressor_fold,
+                    partner_count_effect_scale,
+                    partner_count_effect_center,
+                    partner_count_effect_width,
+                    assay_noise_scale,
+                    target_scale_mapping,
+                    run_seed + 29,
+                    mapping_reference_values,
                 )
                 audit_summary["pool"] = "audit"
                 audit_summary.to_csv(audit_path, index=False)
-            suppressor_target_scale = "raw" if target_scale_mapping == "latent" else "log"
+            suppressor_target_scale = "raw"
+            if noise_model is not None and target_scale_mapping != "latent":
+                suppressor_target_scale = "log" if "log" in noise_model.target_scale else "raw"
 
             run_rows.append({
                 "run_id": run_id,
@@ -1458,60 +1639,85 @@ def run_simulated_scaling(
                 "audit_rows": int(len(audit_summary)),
                 "interaction_path": str(interaction_path),
                 "audit_pool_path": str(audit_path),
+                "mapping_calibration_path": (
+                    str(mapping_calibration_path) if mapping_calibration_path else ""
+                ),
             })
 
-            direct_evaluator = LazyCommunityEvaluator(
+            observed_evaluator = LazyCommunityEvaluator(
                 interaction_data,
                 run_target_species,
                 simulation_kwargs,
                 run_seed + 500_000,
             )
-            direct_scores: dict[tuple[str, ...], float] = {}
+            truth_evaluator = LazyCommunityEvaluator(
+                interaction_data,
+                run_target_species,
+                {**simulation_kwargs, "assay_noise_scale": 0.0},
+                run_seed + 700_000,
+            )
 
             def score_direct_groups(groups: list[tuple[str, ...]]) -> np.ndarray:
-                for group in groups:
-                    if group not in direct_scores:
-                        direct_scores[group] = direct_evaluator.measure(group)
-                return np.array([direct_scores[group] for group in groups], dtype=float)
+                return np.array([observed_evaluator.measure(group) for group in groups], dtype=float)
 
-            direct_phase2_path = pools_path / f"{run_id}_direct_phase2.csv"
-            if direct_phase2_path.exists():
-                direct_optimizer_results = {
-                    row["optimizer"]: row
-                    for row in pd.read_csv(direct_phase2_path).to_dict("records")
-                }
-            else:
-                direct_optimizer_results = {}
-                for optimizer in phase2_optimizers:
-                    recommendation_groups, search_scores, evaluated_count = run_phase2_optimizer(
-                        optimizer,
-                        score_direct_groups,
-                        partners,
-                        valid_partner_counts,
-                        run_seed + 600_000 + sum(ord(char) for char in optimizer),
-                        phase2_top_k,
-                        proposal_candidate_size,
-                    )
-                    validated_summary = direct_evaluator.summary_for(recommendation_groups)
-                    validated_values = validated_summary["final_target_biomass"].to_numpy(dtype=float)
-                    best_position = int(np.argmin(validated_values))
-                    direct_optimizer_results[optimizer] = {
-                        "optimizer": optimizer,
-                        "recommended_count": int(len(recommendation_groups)),
-                        "optimizer_evaluated_count": int(evaluated_count),
-                        "best_search_score": float(np.min(search_scores)),
-                        "best_validated_biomass": float(validated_values[best_position]),
-                        "mean_validated_biomass": float(np.mean(validated_values)),
-                        "best_recommended_community": validated_summary["community"].iloc[best_position],
-                        "best_recommended_partner_count": int(validated_summary["partner_count"].iloc[best_position]),
-                    }
-                pd.DataFrame(direct_optimizer_results.values()).to_csv(direct_phase2_path, index=False)
+            direct_budgets = [budget for budget in budgets if budget <= max_budget]
+            if not direct_budgets:
+                direct_budgets = [max_budget]
+            for measured_count in direct_budgets:
+                direct_phase2_path = pools_path / f"{run_id}_direct_phase2_{measured_count}.csv"
+                if direct_phase2_path.exists():
+                    direct_optimizer_results = pd.read_csv(direct_phase2_path).to_dict("records")
+                else:
+                    direct_optimizer_results = []
+                    for optimizer in phase2_optimizers:
+                        recommendation_groups, search_scores, evaluated_count = run_phase2_optimizer(
+                            optimizer,
+                            score_direct_groups,
+                            partners,
+                            valid_partner_counts,
+                            run_seed + 600_000 + sum(ord(char) for char in optimizer),
+                            phase2_top_k,
+                            proposal_candidate_size,
+                            measurement_budget=measured_count,
+                        )
+                        if evaluated_count != measured_count:
+                            raise RuntimeError(
+                                f"{optimizer} used {evaluated_count} of {measured_count} measurements"
+                            )
+                        validated_summary = truth_evaluator.summary_for(recommendation_groups)
+                        validated_values = validated_summary["final_target_biomass"].to_numpy(dtype=float)
+                        best_position = int(np.argmin(validated_values))
+                        direct_optimizer_results.append({
+                            "optimizer": optimizer,
+                            "recommended_count": int(len(recommendation_groups)),
+                            "optimizer_evaluated_count": int(evaluated_count),
+                            "best_search_score": float(np.min(search_scores)),
+                            "best_validated_biomass": float(validated_values[best_position]),
+                            "mean_validated_biomass": float(np.mean(validated_values)),
+                            "best_recommended_community": validated_summary["community"].iloc[best_position],
+                            "best_recommended_partner_count": int(
+                                validated_summary["partner_count"].iloc[best_position]
+                            ),
+                        })
+                    pd.DataFrame(direct_optimizer_results).to_csv(direct_phase2_path, index=False)
+
+                for result in direct_optimizer_results:
+                    phase2_rows.append({
+                        "run_id": run_id,
+                        "species_count": species_count,
+                        "seed": run_seed,
+                        "strategy": "direct",
+                        "search_source": "simulator",
+                        "model": "simulator_baseline",
+                        "feature_set": "truth",
+                        "measured_count": int(measured_count),
+                        **result,
+                    })
 
             for strategy in strategies:
                 strategy_seed = run_seed + sum(ord(char) for char in strategy)
                 strategy_rng = np.random.default_rng(strategy_seed)
-                evaluator = direct_evaluator
-                strategy_workspace = pools_path / f"{run_id}_{strategy}_evaluation.csv"
+                evaluator = observed_evaluator
                 final_measured_path = pools_path / f"{run_id}_{strategy}_measured.csv"
                 if final_measured_path.exists():
                     final_measured_summary = pd.read_csv(final_measured_path)
@@ -1521,8 +1727,6 @@ def run_simulated_scaling(
                         partners,
                         valid_partner_counts,
                         evaluator,
-                        audit_summary,
-                        strategy_workspace,
                         run_target_species,
                         species_ids,
                         strategy_seed,
@@ -1566,13 +1770,20 @@ def run_simulated_scaling(
                     budget_metric_rows = []
                     budget_phase2_rows = []
                     measured_summary = final_measured_summary.iloc[:measured_count].copy()
-                    evaluation_path = pools_path / f"{run_id}_{strategy}_{measured_count}_evaluation.csv"
-                    dataset, measured_indices, audit_indices, _evaluation_summary = build_evaluation_dataset(
-                        measured_summary,
-                        audit_summary,
-                        evaluation_path,
+                    evaluation_summary = pd.concat(
+                        [measured_summary, audit_summary],
+                        ignore_index=True,
+                    )
+                    dataset = dataset_from_summary(
+                        evaluation_summary,
                         run_target_species,
                         species_ids,
+                    )
+                    measured_indices = np.arange(len(measured_summary), dtype=int)
+                    audit_indices = np.arange(
+                        len(measured_summary),
+                        len(evaluation_summary),
+                        dtype=int,
                     )
                     train_indices = measured_indices
                     audit_median = float(np.median(dataset.target_biomass[audit_indices]))
@@ -1586,36 +1797,31 @@ def run_simulated_scaling(
                         float(np.min(dataset.target_biomass[train_indices])),
                     )]
                     for band in partner_count_bands:
-                        in_band = lambda counts: (counts >= band.min_count) & (counts <= band.max_count)
-                        audit_mask = in_band(audit_partner_counts)
+                        audit_mask = (
+                            (audit_partner_counts >= band.min_count)
+                            & (audit_partner_counts <= band.max_count)
+                        )
                         if not np.any(audit_mask):
                             continue
-                        train_mask = in_band(train_partner_counts)
-                        if not np.any(train_mask):
-                            continue
+                        train_mask = (
+                            (train_partner_counts >= band.min_count)
+                            & (train_partner_counts <= band.max_count)
+                        )
+                        best_measured = float("nan")
+                        if np.any(train_mask):
+                            best_measured = float(
+                                np.min(dataset.target_biomass[train_indices[train_mask]])
+                            )
                         evaluation_slices.append((
                             band.display_label,
                             audit_indices[audit_mask],
                             np.flatnonzero(audit_mask),
                             float(np.min(dataset.target_biomass[audit_indices[audit_mask]])),
-                            float(np.min(dataset.target_biomass[train_indices[train_mask]])),
+                            best_measured,
                         ))
 
-                    for optimizer, result in direct_optimizer_results.items():
-                        budget_phase2_rows.append({
-                            "run_id": run_id,
-                            "species_count": species_count,
-                            "seed": run_seed,
-                            "strategy": strategy,
-                            "search_source": "simulator",
-                            "model": "simulator_baseline",
-                            "feature_set": "truth",
-                            "measured_count": int(measured_count),
-                            **result,
-                        })
-
                     for model_name, feature_set in model_setup:
-                        model, features = fit_model(
+                        model, features = train_active_model(
                             dataset,
                             model_name,
                             feature_set,
@@ -1639,7 +1845,9 @@ def run_simulated_scaling(
                             best_audit,
                             best_measured,
                         ) in evaluation_slices:
-                            best_gap = max(0.0, best_measured - best_audit)
+                            best_gap = float("nan")
+                            if np.isfinite(best_measured):
+                                best_gap = max(0.0, best_measured - best_audit)
                             predictions = full_predictions[prediction_positions]
                             row = {
                                 **row_base,
@@ -1667,7 +1875,12 @@ def run_simulated_scaling(
                         def score_surrogate_groups(groups: list[tuple[str, ...]]) -> np.ndarray:
                             missing = [group for group in groups if group not in surrogate_scores]
                             if missing:
-                                group_features = features_for_partner_groups(missing, partners, feature_set)
+                                group_features = presence_from_groups(missing, partners).astype(float)
+                                if feature_set == "pairwise":
+                                    group_features = add_pairwise_features(
+                                        group_features,
+                                        partners,
+                                    )[0]
                                 predictions = model.predict(group_features)
                                 for group, prediction in zip(missing, predictions, strict=True):
                                     surrogate_scores[group] = float(prediction)
@@ -1679,11 +1892,11 @@ def run_simulated_scaling(
                                 score_surrogate_groups,
                                 partners,
                                 valid_partner_counts,
-                                run_seed + measured_count + sum(ord(char) for char in optimizer),
+                                run_seed + 600_000 + sum(ord(char) for char in optimizer),
                                 phase2_top_k,
                                 proposal_candidate_size,
                             )
-                            validated_summary = evaluator.summary_for(recommendation_groups)
+                            validated_summary = truth_evaluator.summary_for(recommendation_groups)
                             validated_values = validated_summary["final_target_biomass"].to_numpy(dtype=float)
                             best_position = int(np.argmin(validated_values))
                             best_validated = float(validated_values[best_position])
@@ -1848,8 +2061,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assay-noise-scale", type=float, default=1.0)
     parser.add_argument(
         "--target-scale-mapping",
-        choices=["zscore", "latent"],
-        default="zscore",
+        choices=["zscore", "quantile", "latent"],
+        default="quantile",
     )
     parser.add_argument("--suppressor-fold", type=float, default=2.0)
     parser.add_argument("--buffer-z", type=float, default=1.96)
@@ -1857,12 +2070,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def optional_existing_path(path: str) -> str | None:
-    return path if path and Path(path).exists() else None
-
-
 def main() -> None:
     args = parse_args()
+    real_summary_path = args.real_summary.strip() or None
+    effect_prior_csv = args.effect_prior_csv.strip() or None
+    if real_summary_path and not Path(real_summary_path).exists():
+        raise FileNotFoundError(real_summary_path)
+    if effect_prior_csv and not Path(effect_prior_csv).exists():
+        raise FileNotFoundError(effect_prior_csv)
     runs_path, metrics_path, summary_path = run_simulated_scaling(
         output_dir=args.output_dir,
         species_counts=parse_int_grid(args.species_counts),
@@ -1880,8 +2095,8 @@ def main() -> None:
         target_species=args.target_species,
         models=parse_model_names(args.models),
         strategies=[item.strip() for item in args.strategies.split(",") if item.strip()],
-        real_summary_path=optional_existing_path(args.real_summary),
-        effect_prior_csv=optional_existing_path(args.effect_prior_csv),
+        real_summary_path=real_summary_path,
+        effect_prior_csv=effect_prior_csv,
         interaction_range=args.interaction_range,
         off_diagonal_min=args.off_diagonal_min,
         off_diagonal_max=args.off_diagonal_max,

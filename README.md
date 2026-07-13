@@ -56,9 +56,9 @@ Used as a reference for fitting interaction-effect priors that mimic real-world 
   --interaction-response saturating \
   --saturation-pressure 1.0 \
   --target-interaction-scale 1 \
-  --target-scale-mapping latent \
+  --target-scale-mapping quantile \
   --assay-noise-scale 1 \
-  --output-dir GLV_ML/outputs/benchmarks/scaling_laws_simulated_phase2_hierarchical_saturating_latent_noise
+  --output-dir GLV_ML/outputs/benchmarks/scaling_laws_simulated_phase2_hierarchical_saturating_quantile_noise
 ```
 
 Parameter notes:
@@ -66,7 +66,7 @@ Parameter notes:
 - `--species-counts`: species-pool sizes to test. The target species is included in each pool.
 - `--partner-counts`: number of non-target partners in each community. Total community size is `partner_count + 1` because the target is always present.
 - `--partner-count-bands`: reporting bands used to evaluate whether model performance changes across small, medium, and large communities within the same species pool.
-- `--proposal-candidate-size`: number of candidate communities sampled when a strategy or Phase 2 optimizer needs a candidate pool. It is not a per-community-size limit.
+- `--proposal-candidate-size`: candidate pool used by max-diversity, Bayesian acquisition, and Phase 2 `predicted_best`. Walk optimizers evaluate only their own paths.
 - `--audit-size`: maximum number of hidden audit communities used to evaluate trained models.
 - `--audit-fraction`: caps audit rows as a fraction of the finite combinatorial space, mainly to avoid oversized audit pools for smaller species counts.
 - `--budgets`: measured-row checkpoints used to train/evaluate models and estimate how many measurements are needed.
@@ -83,9 +83,17 @@ Parameter notes:
 - `--interaction-response`: simulated landscape scaling accepts `saturating`; off-diagonal pressure is bounded inside the integrated GLV equations.
 - `--saturation-pressure`: pressure scale where saturating interactions begin to plateau.
 - `--target-interaction-scale`: multiplier for target-row interactions; useful as a diagnostic target-effect rescaling knob.
-- `--target-scale-mapping`: output mapping for target biomass. `latent` keeps GLV latent biomass; `zscore` maps to the real-world target scale before noise.
+- `--target-scale-mapping`: output mapping for target biomass. `quantile` maps latent biomass ranks to the real-world target distribution using an independent calibration landscape shared across species counts; `zscore` uses mean/std mapping; `latent` keeps GLV latent biomass.
 - `--assay-noise-scale`: multiplier for fitted assay noise. Use `0` for deterministic labels and `1` for calibrated lab-like noise.
 - `--output-dir`: output directory for run metadata, sampled pools, metrics, summaries, and plots.
+
+`random` samples uniformly from all available communities; `size_balanced` deliberately
+allocates similar row counts to each requested partner count. Phase 2 training and direct
+search both use noisy observations. Direct search spends exactly the current training-row
+budget, while final optimizer recommendations are validated against deterministic
+zero-noise simulator values. `bayesian_optimization` refits a Gaussian process after each
+measured batch and selects the next batch by Expected Improvement. Mapped values extrapolate
+beyond the calibration tails instead of being clamped to the real-data extrema.
 
 
 ## Script Reference
@@ -281,12 +289,12 @@ GLV_ML/outputs/calibration/suppressor_rates/suppressor_rate_calibration.csv
 
 ### `simulated_landscape_scaling.py`
 
-Generates sampled simulated landscapes, trains surrogates at increasing measurement budgets, evaluates audit performance, and runs Phase 2 optimizer walks over surrogate and direct simulator landscapes.
+Generates sampled simulated landscapes, trains surrogates at increasing measurement budgets, evaluates audit performance, and compares free surrogate walks with direct optimizers spending the same number of noisy simulator measurements.
 
 Depends on:
 
-- optional real-world summary for assay noise: `GLV_ML/outputs/real_world/log/rw_summary.csv`
-- optional effect priors: `GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv`
+- `GLV_ML/outputs/real_world/log/rw_summary.csv` for `quantile` or `zscore` target mapping
+- optionally `GLV_ML/outputs/calibration/assay_noise/interaction_effect_prior.csv`
 
 Recommended first full run without Bayesian acquisition:
 
@@ -313,9 +321,9 @@ Recommended first full run without Bayesian acquisition:
   --interaction-response saturating \
   --saturation-pressure 1.0 \
   --target-interaction-scale 1 \
-  --target-scale-mapping latent \
+  --target-scale-mapping quantile \
   --assay-noise-scale 1 \
-  --output-dir GLV_ML/outputs/benchmarks/scaling_laws_simulated_phase2_hierarchical_saturating_latent_noise
+  --output-dir GLV_ML/outputs/benchmarks/scaling_laws_simulated_phase2_hierarchical_saturating_quantile_noise
 ```
 
 Noiseless diagnostic run:
@@ -355,7 +363,12 @@ simulated_scaling_metrics.csv
 simulated_scaling_summary.csv
 phase2_optimizer_metrics.csv
 phase2_optimizer_summary.csv
+run_config.json
 ```
+
+`run_config.json` records the first invocation for provenance. Resume stability comes from
+persisted interaction/pool CSVs and deterministic per-community noise seeds. The output
+directory is the run identity, so use a new directory for a scientifically different run.
 
 ### `active_learning.py`
 
@@ -451,15 +464,64 @@ Run real-world scaling laws:
   GLV_ML/outputs/real_world/log/rw_summary.csv \
   --output-dir GLV_ML/outputs/benchmarks/scaling_laws_real/log \
   --target-species pathogen \
-  --species-counts 3,4,5,6,7,8,9,10,11 \
+  --species-counts 5,6,7,8,9,10,11 \
   --universes-per-size 5 \
-  --train-fractions 0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40 \
+  --train-grid log \
   --models ridge_pairwise,random_forest,hist_gradient_boosting
+```
+
+Parameter notes:
+
+- `--species-counts`: retained partner-species universe sizes. k=3 and k=4 are omitted by default: the suppressor cutoff sits 2-fold below each universe's own median, and universes that small hold almost no such community (prevalence 2.9% and 4.0%), so every suppressor metric there is undefined.
+- `--train-grid`: `log` (default) uses geometric row budgets, so the bracket around the requirement is a fixed ratio wide at every `k`. `fraction` restores the old `--train-fractions` grid, whose first checkpoint at k=11 is already 102 measurements.
+
+`scaling_law_required_rows.csv` now brackets each crossing (`<p>_lower_rows`, `<p>_required_rows`, `<p>_censored`) and carries `test_rows` and `true_suppressor_count`, because a universe that never crosses is right-censored rather than missing. Undefined suppressor metrics stay NaN instead of being filled with `0.0`.
+
+### `scaling_law_fits.py`
+
+Fits and compares competing scaling hypotheses for the measurements required, `n_tau(k)`, against the structural sizes of the problem: the full landscape `2^k - 1`, main effects `k`, and the pairwise representation size `k + C(k,2)`.
+
+Depends on:
+
+- `scaling_laws.py` output: `scaling_law_metrics.csv`
+
+Fit and compare hypotheses:
+
+```bash
+.venv/bin/python GLV_ML/scaling_law_fits.py \
+  GLV_ML/outputs/benchmarks/scaling_laws_real/scaling_law_metrics.csv \
+  --output-dir GLV_ML/outputs/benchmarks/scaling_laws_real/fits \
+  --primary-metric suppressor_auprc \
+  --identifiability-draws 200
+```
+
+Four hypotheses are fitted: `constant`, `linear` (`a*k + b`), `power_pairwise` (`a*d(k)^gamma`), and `power_landscape` (`a*(2^k - 1)^beta`). Each exponent tests a reference size directly: `beta = 1` is a constant fraction of the landscape, `gamma = 1` is a constant number of measurements per pairwise coefficient.
+
+Three things about this fit are not optional:
+
+- **Censoring.** The largest budget is `0.75*(2^k - 1)`, so a universe that never reaches the threshold gives `n_tau(k) > max_budget`, not a missing value. Censoring concentrates at small `k`, and dropping those universes steepens `beta` by roughly `+0.2`. Every universe is entered as a censored observation and fitted by maximum likelihood (Tobit).
+- **Undefined metrics.** A suppressor metric needs a true suppressor in the held-out split. `--min-test-suppressors` (default 1) drops universes where it cannot exist, into `scaling_law_excluded_universes.csv`. That does not make it *reliable*: at k=5 the split holds a median of 0.67 positives, so raise the threshold to about 5 when the question is what the exponent is.
+- **Identifiability.** `--identifiability-draws` simulates from each hypothesis through the real budget grid and reports how often AIC recovers the family that produced it. Run it before believing a ranking.
+
+Parameter notes:
+
+- `--metrics` / `--thresholds`: metric columns and the threshold `tau` defining `n_tau`. One threshold, or one per metric.
+- `--min-test-suppressors`: drop universes holding out fewer true suppressors than this.
+- `--extrapolate-to`: project the fitted laws out to this universe size.
+
+Main outputs:
+
+```text
+scaling_law_fit_comparison.csv
+scaling_law_reference_comparison.csv
+scaling_law_nested_tests.csv
+scaling_law_identifiability.csv
+scaling_law_beta_recovery.csv
 ```
 
 ## Notes
 
 - `--batch-size` controls acquisition batch size in some scripts. It does not automatically set reporting checkpoints unless the script says so; use explicit `--budgets` or `--train-sizes` when you need exact reporting points.
 - `--assay-noise-scale 0` gives deterministic/noiseless observed labels. `--assay-noise-scale 1` uses the fitted assay-noise scale.
-- `target-scale-mapping latent` keeps simulated target biomass on the GLV latent scale. `zscore` maps latent values to the real-world target scale before noise.
+- `target-scale-mapping quantile` is the preferred noisy assay mode. It fits one mapping from an independent max-species calibration landscape for the run and reuses it across measured rows, audit rows, phase-2 validation, species-count prefixes, and seeds. `latent` keeps simulated target biomass on the GLV latent scale for noiseless mechanics checks. `zscore` uses the same independent calibration distribution with mean/std mapping.
 - The GNN model is available as `gnn`, but it is slower than the other listed models.
