@@ -15,6 +15,7 @@ exports:
   - suppressor_auprc_by_method.png
   - selection_comparison.csv
   - selection_comparison_gap.png
+  - selection_comparison_exploitation_gap.png
   - selection_comparison_rmse.png
 consumes:
   - real_world_data.rw_summary.csv
@@ -24,15 +25,15 @@ consumes:
   - active_learning.active_learning_rounds.csv (for joint model-dependent vs independent plots)
 verification:
   syntax: ".venv/bin/python -m py_compile GLV_ML/selection_baselines.py GLV_ML/compare_selection_runs.py"
-  smoke: ".venv/bin/python GLV_ML/selection_baselines.py GLV_ML/outputs/real_world/log/rw_summary.csv --target-species pathogen --output-dir GLV_ML/outputs/benchmarks/selection_baselines_smoke --batch-size 25 --rounds 4 --seeds 1 --models ridge_pairwise --methods random,greedy_forward,hill_climb,simulated_annealing"
+  smoke: ".venv/bin/python GLV_ML/selection_baselines.py GLV_ML/outputs/real_world/log/rw_summary.csv --target-species pathogen --output-dir GLV_ML/outputs/benchmarks/selection_baselines_smoke --batch-size 25 --rounds 4 --seeds 1 --models ridge_pairwise --methods greedy_forward,hill_climb,simulated_annealing"
 ---
 
 # Model-Independent Selection / Search Benchmark
 
 This domain owns `GLV_ML/selection_baselines.py`. It evaluates the classic combinatorial
-**search and selection heuristics** used in bioinformatics for community/feature discovery —
-random search, greedy forward selection, greedy backward elimination, hill climbing,
-simulated annealing — plus simple space-filling baselines. These are **model-independent**:
+**objective-guided search heuristics** used in bioinformatics for community/feature
+discovery — greedy forward selection, greedy backward elimination, hill climbing,
+simulated annealing, and genetic algorithms. These are **model-independent**:
 the search is guided by the **true measured biomass** of the communities it has probed, not
 by any surrogate's prediction. No ML is involved in deciding what to measure.
 
@@ -77,7 +78,6 @@ For each method, reported separately (a method can win one and lose the other):
 All methods choose what to measure using only community composition and the true biomass of
 already-measured communities. None consult a surrogate.
 
-- `random`: measure communities in uniform random order. The honest baseline.
 - `greedy_forward`: forward selection — from a small community, repeatedly measure the
   single-partner additions and move to the lowest-biomass one; random restarts.
 - `greedy_backward`: backward elimination — from a large community, repeatedly measure the
@@ -87,12 +87,14 @@ already-measured communities. None consult a surrogate.
 - `simulated_annealing`: from a random community, measure a proposed neighbor each iteration
   and accept downhill moves always, uphill moves with probability `exp(-Δ/T)`; cooling
   schedule `--start-temperature` × `--cooling`; random restarts.
-- `max_diversity`: farthest-point (max-min Hamming) space-filling order — coverage baseline,
-  uses composition only.
 - `size_balanced`: round-robin across partner-count classes — coverage baseline.
 
 A method that needs predicted biomass to decide is a model-dependent strategy and belongs in
 `active_learning.py`, not here.
+
+Uniform random and max-diversity sampling also belong in `active_learning.py`: they are
+composition-only acquisition controls for constructing surrogate training sets, not
+objective-guided searches that walk already measured biomass values.
 
 ## Evaluation Loop (oracle replay)
 
@@ -139,6 +141,14 @@ the two union directly. `measured_count` is the grid point; metrics come from th
 
 `selection_baselines_summary.csv` — repeated seeds aggregated by `model`, `strategy`,
 `measured_count` (mean and std). The main measurement-efficiency table.
+
+`compare_selection_runs.py` keeps acquisition and exploitation separate. Acquisition
+plots compare `global_best_gap_fraction` from measured prefixes. Exploitation plots compare
+the active learner's validated top-k surrogate recommendation against the direct search
+method's best measured community at the same measurement budget. Matched reports must use
+the same dataset, split seed series, measured-count grid, and model list. Both exploitation
+gaps use the complete finite screen's best biomass as their common reference; the direct
+search still cannot query held-out audit rows.
 
 ## Plotting
 

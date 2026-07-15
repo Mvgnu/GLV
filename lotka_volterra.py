@@ -125,11 +125,15 @@ def hierarchical_interaction_matrix(
     hierarchy_noise,
     rng,
 ):
-    """Create trait-structured interactions with dominant broad-effect species."""
+    """Create balanced trait-structured interactions with broad-effect species."""
     if carrying_capacity_min <= 0 or carrying_capacity_max <= 0:
         raise ValueError("carrying capacities must be positive")
 
-    dominance = np.linspace(1.0, 0.0, species_count)
+    # A low-discrepancy sequence gives every nested species prefix broad trait coverage.
+    golden_ratio_conjugate = (np.sqrt(5.0) - 1.0) / 2.0
+    dominance = (
+        rng.random() + np.arange(species_count) * golden_ratio_conjugate
+    ) % 1.0
     carrying_capacity = (
         carrying_capacity_min
         + (carrying_capacity_max - carrying_capacity_min) * dominance
@@ -178,14 +182,14 @@ def apply_effect_priors(
         if effect_scope == "target_partner_main":
             if species_a not in species_index:
                 continue
-            # Negative ridge coefficients mean lower target biomass, so they map
+            # Negative matched-context effects mean lower target biomass, so they map
             # naturally to a more negative partner effect in the target equation.
             partner_index = species_index[species_a]
-            interaction_matrix[target_index, partner_index] += target_effect_scale * coefficient
+            interaction_matrix[target_index, partner_index] = target_effect_scale * coefficient
         elif effect_scope == "partner_pair":
             if species_a not in species_index or species_b not in species_index:
                 continue
-            # Pairwise ridge effects are output epistasis, not direct GLV terms.
+            # Matched-context pair effects are output epistasis, not direct GLV terms.
             # Positive pair coefficients mean the pair weakens suppression relative
             # to additive effects; partner-partner competition is the GLV proxy.
             first_index = species_index[species_a]
@@ -1177,13 +1181,13 @@ def parse_args():
     parser.add_argument(
         "--target-effect-scale",
         type=float,
-        default=0.25,
+        default=0.3,
         help="Scale mapping empirical main effects onto target-row GLV interactions.",
     )
     parser.add_argument(
         "--pair-effect-scale",
         type=float,
-        default=0.25,
+        default=2.5,
         help="Scale mapping empirical pair output effects onto partner-partner GLV interactions.",
     )
     parser.add_argument("--seed", type=int)

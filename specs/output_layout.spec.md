@@ -35,7 +35,7 @@ default to loose repo-root output folders.
 - `calibration/`
   Assay-noise fits, empirical priors, and suppressor-rate calibration artifacts.
 - `calibration/assay_noise/`
-  Noise model and ridge-derived empirical effect priors.
+  Noise model, matched-context effect priors, and ridge coefficient diagnostics.
 - `calibration/suppressor_rates/`
   Suppressor/non-suppressor rate calibration sweeps.
 - `real_world/`

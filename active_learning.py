@@ -39,6 +39,7 @@ class ActiveLearningConfig:
     diversity_weight: float
     ensemble_size: int
     uncertainty_beta: float
+    phase2_top_k: int
 
 
 def stratified_initial_indices(
@@ -84,13 +85,39 @@ def train_model(dataset, model_name: str, feature_set: str, train_indices: np.nd
 def select_acquisitions(
     strategy: str,
     dataset,
+    measured_indices: np.ndarray,
     candidate_indices: np.ndarray,
     predictions: np.ndarray,
     uncertainty: np.ndarray,
     acquisition_scores: np.ndarray,
     batch_size: int,
     diversity_weight: float,
+    rng: np.random.Generator,
 ) -> np.ndarray:
+    if strategy == "random":
+        return rng.choice(candidate_indices, size=batch_size, replace=False)
+    if strategy == "max_diversity":
+        remaining = rng.permutation(candidate_indices)
+        min_distances = np.full(len(remaining), dataset.presence.shape[1] + 1)
+        for measured_index in measured_indices:
+            min_distances = np.minimum(
+                min_distances,
+                np.abs(
+                    dataset.presence[remaining] - dataset.presence[measured_index]
+                ).sum(axis=1),
+            )
+        selected: list[int] = []
+        while len(selected) < batch_size:
+            best_position = int(np.argmax(min_distances))
+            chosen = int(remaining[best_position])
+            selected.append(chosen)
+            min_distances = np.minimum(
+                min_distances,
+                np.abs(dataset.presence[remaining] - dataset.presence[chosen]).sum(axis=1),
+            )
+            remaining = np.delete(remaining, best_position)
+            min_distances = np.delete(min_distances, best_position)
+        return np.array(selected, dtype=int)
     if strategy == "predicted_best":
         order = np.argsort(predictions[candidate_indices])
         return candidate_indices[order[:batch_size]]
@@ -472,6 +499,8 @@ def round_metrics(
     best_measured = float(np.min(dataset.target_biomass[measured_indices]))
     global_best = float(np.min(dataset.target_biomass[discoverable_indices]))
     global_best_gap = best_measured - global_best
+    complete_global_best = float(np.min(dataset.target_biomass))
+    complete_global_best_gap = best_measured - complete_global_best
 
     return {
         "audit_rows": int(len(audit_indices)),
@@ -479,9 +508,39 @@ def round_metrics(
         "global_best_biomass": global_best,
         "global_best_gap": float(global_best_gap),
         "global_best_gap_fraction": float(global_best_gap / max(abs(global_best), 1e-12)),
+        "complete_global_best_biomass": complete_global_best,
+        "complete_global_best_gap": float(complete_global_best_gap),
+        "complete_global_best_gap_fraction": float(
+            complete_global_best_gap / max(abs(complete_global_best), 1e-12)
+        ),
         **regression_metrics(y_true, y_pred),
         **suppressor_metrics,
     }
+
+
+def surrogate_recommendation_metrics(
+    dataset,
+    model,
+    features: np.ndarray,
+    top_k: int,
+) -> tuple[dict[str, float], np.ndarray, np.ndarray]:
+    """Validate the model's exact top-k recommendations on the finite screen."""
+    predictions = model.predict(features)
+    recommended = np.argsort(predictions, kind="stable")[:top_k]
+    validated = dataset.target_biomass[recommended]
+    global_best = float(np.min(dataset.target_biomass))
+    gap = float(np.min(validated) - global_best)
+    return (
+        {
+            "surrogate_best_validated_biomass": float(np.min(validated)),
+            "surrogate_mean_validated_biomass": float(np.mean(validated)),
+            "surrogate_global_best_biomass": global_best,
+            "surrogate_global_best_gap": gap,
+            "surrogate_global_best_gap_fraction": gap / max(abs(global_best), 1e-12),
+        },
+        recommended,
+        predictions,
+    )
 
 
 def acquisition_rows(
@@ -623,6 +682,13 @@ def write_active_learning_plots(summary: pd.DataFrame, output_path: Path) -> Non
     )
     plot_metric_by_model(
         summary,
+        "surrogate_global_best_gap_fraction",
+        output_path / "surrogate_recommendation_gap_by_model.png",
+        "Validated Surrogate Recommendations by Model",
+        "Relative gap to global best",
+    )
+    plot_metric_by_model(
+        summary,
         "rmse",
         output_path / "model_rmse_by_model.png",
         "RMSE by Model",
@@ -693,7 +759,7 @@ def run_active_learning(
     selected_models: list[str] | None,
     strategies: list[str],
     config: ActiveLearningConfig,
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path]:
     dataset = load_dataset(summary_path, target_species, species_ids)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -701,6 +767,7 @@ def run_active_learning(
 
     round_output_rows: list[dict[str, object]] = []
     acquisition_output_rows: list[dict[str, object]] = []
+    recommendation_output_rows: list[dict[str, object]] = []
 
     for run_index in range(config.seeds):
         split_seed = config.seed + run_index
@@ -746,6 +813,14 @@ def run_active_learning(
                         median_biomass,
                         config.suppressor_fold,
                     )
+                    recommendation_metrics, recommended_indices, all_predictions = (
+                        surrogate_recommendation_metrics(
+                            dataset,
+                            model,
+                            features,
+                            config.phase2_top_k,
+                        )
+                    )
                     round_output_rows.append({
                         "seed": split_seed,
                         "model": model_name,
@@ -756,7 +831,22 @@ def run_active_learning(
                         "new_measurements": int(last_new_measurements),
                         "pool_rows_remaining": int(len(candidate_indices)),
                         **metrics,
+                        **recommendation_metrics,
                     })
+                    for rank, row_index in enumerate(recommended_indices, start=1):
+                        recommendation_output_rows.append({
+                            "seed": split_seed,
+                            "model": model_name,
+                            "strategy": strategy,
+                            "round": round_index,
+                            "measured_count": int(len(measured_indices)),
+                            "recommendation_rank": rank,
+                            "row_index": int(row_index),
+                            "community": dataset.communities[row_index],
+                            "partner_count": int(dataset.partner_counts[row_index]),
+                            "predicted_target_biomass": float(all_predictions[row_index]),
+                            "true_target_biomass": float(dataset.target_biomass[row_index]),
+                        })
 
                     if round_index == max_rounds or len(candidate_indices) == 0:
                         break
@@ -776,12 +866,21 @@ def run_active_learning(
                     selected_indices = select_acquisitions(
                         strategy,
                         dataset,
+                        measured_indices,
                         candidate_indices,
                         predictions,
                         uncertainty,
                         acquisition_scores,
                         min(config.batch_size, len(candidate_indices)),
                         config.diversity_weight,
+                        np.random.default_rng(
+                            split_seed
+                            + round_index
+                            + sum(
+                                (index + 1) * ord(character)
+                                for index, character in enumerate(strategy)
+                            )
+                        ),
                     )
                     acquisition_output_rows.extend(
                         acquisition_rows(
@@ -804,18 +903,21 @@ def run_active_learning(
 
     rounds_path = output_path / "active_learning_rounds.csv"
     acquisitions_path = output_path / "active_learning_acquisitions.csv"
+    recommendations_path = output_path / "active_learning_recommendations.csv"
     summary_path_out = output_path / "active_learning_summary.csv"
     rounds = pd.DataFrame(round_output_rows)
     acquisitions = pd.DataFrame(acquisition_output_rows)
+    recommendations = pd.DataFrame(recommendation_output_rows)
     summary = summarize_rows(round_output_rows)
 
     write_csv(rounds, rounds_path)
     write_csv(acquisitions, acquisitions_path)
+    write_csv(recommendations, recommendations_path)
     write_csv(summary, summary_path_out)
 
     write_active_learning_plots(summary, output_path)
 
-    return rounds_path, acquisitions_path, summary_path_out
+    return rounds_path, acquisitions_path, recommendations_path, summary_path_out
 
 
 def parse_args() -> argparse.Namespace:
@@ -833,9 +935,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--strategies",
-        default="predicted_best,diverse_predicted_best,size_balanced_predicted_best",
+        default="random,max_diversity",
         help=(
-            "Comma-separated model-dependent acquisition strategies. Available: "
+            "Comma-separated acquisition strategies. Available: random, max_diversity, "
             "predicted_best, diverse_predicted_best, size_balanced_predicted_best, "
             "ensemble_uncertainty (bootstrap-ridge std), ucb_suppression, "
             "ridge_posterior_uncertainty/ridge_posterior_ucb (analytic Bayesian-ridge "
@@ -868,12 +970,18 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Uncertainty weight for ucb_suppression; higher explores more.",
     )
+    parser.add_argument(
+        "--phase2-top-k",
+        type=int,
+        default=5,
+        help="Exact lowest-predicted communities validated after each model fit.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    rounds_path, acquisitions_path, summary_path = run_active_learning(
+    rounds_path, acquisitions_path, recommendations_path, summary_path = run_active_learning(
         summary_path=args.summary_path,
         output_dir=args.output_dir,
         species_ids=parse_species_ids(args.species_ids),
@@ -891,11 +999,13 @@ def main() -> None:
             diversity_weight=args.diversity_weight,
             ensemble_size=args.ensemble_size,
             uncertainty_beta=args.uncertainty_beta,
+            phase2_top_k=args.phase2_top_k,
         ),
     )
 
     print(f"Wrote active-learning rounds to {rounds_path}")
     print(f"Wrote active-learning acquisitions to {acquisitions_path}")
+    print(f"Wrote active-learning recommendations to {recommendations_path}")
     print(f"Wrote active-learning summary to {summary_path}")
 
 

@@ -17,8 +17,12 @@ from ml_benchmark import write_csv
 
 
 COMPARISON_COLUMNS = [
+    "best_measured_biomass",
     "global_best_gap_fraction",
     "global_best_gap",
+    "complete_global_best_gap_fraction",
+    "surrogate_best_validated_biomass",
+    "surrogate_global_best_gap_fraction",
     "rmse",
     "spearman",
     "suppressor_auprc",
@@ -40,6 +44,18 @@ def load_summary(path: str | None, method_family: str) -> list[dict[str, object]
         }
         for column in COMPARISON_COLUMNS:
             record[column] = float(row.get(column, float("nan")))
+        if method_family == "model_dependent":
+            record["exploitation_best_biomass"] = record[
+                "surrogate_best_validated_biomass"
+            ]
+            record["exploitation_gap_fraction"] = record[
+                "surrogate_global_best_gap_fraction"
+            ]
+        else:
+            record["exploitation_best_biomass"] = record["best_measured_biomass"]
+            record["exploitation_gap_fraction"] = record[
+                "complete_global_best_gap_fraction"
+            ]
         rows.append(record)
     return rows
 
@@ -226,6 +242,17 @@ def compare_runs(
             higher_is_better=False,
         )
         plot_paths.append(gap_path)
+        exploitation_path = output_path / "selection_comparison_exploitation_gap.png"
+        plot_metric(
+            comparison,
+            "exploitation_gap_fraction",
+            exploitation_path,
+            "Validated Recommendations: surrogate vs direct search",
+            "Relative gap to best suppressor",
+            top_n=top_n,
+            higher_is_better=False,
+        )
+        plot_paths.append(exploitation_path)
         rmse_path = output_path / "selection_comparison_rmse.png"
         plot_metric(
             comparison,
@@ -251,6 +278,20 @@ def compare_runs(
                 x_max=combined_x_max,
             )
             plot_paths.append(gap_combined_path)
+            exploitation_combined_path = (
+                output_path / "selection_comparison_exploitation_gap_combined.png"
+            )
+            plot_metric_combined(
+                comparison,
+                "exploitation_gap_fraction",
+                exploitation_combined_path,
+                "Validated Recommendations: surrogate vs direct search",
+                "Relative gap to best suppressor",
+                top_n=top_n,
+                higher_is_better=False,
+                x_max=combined_x_max,
+            )
+            plot_paths.append(exploitation_combined_path)
             rmse_combined_path = output_path / "selection_comparison_rmse_combined.png"
             plot_metric_combined(
                 comparison,

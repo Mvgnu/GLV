@@ -7,8 +7,10 @@ paths:
 exports:
   - active_learning_rounds.csv
   - active_learning_acquisitions.csv
+  - active_learning_recommendations.csv
   - active_learning_summary.csv
   - best_suppressor_gap_model_dependent_by_model.png
+  - surrogate_recommendation_gap_by_model.png
   - model_rmse_by_model.png
   - model_rmse_by_strategy.png
   - suppressor_precision_by_model.png
@@ -24,7 +26,7 @@ consumes:
   - ml.TargetBiomassDataset loading and model conventions
 verification:
   syntax: ".venv/bin/python -m py_compile GLV_ML/active_learning.py"
-  smoke: ".venv/bin/python GLV_ML/active_learning.py GLV_ML/outputs/real_world/log/rw_summary.csv --target-species pathogen --output-dir GLV_ML/outputs/benchmarks/active_learning_smoke --initial-size 50 --batch-size 25 --rounds 2 --seeds 1 --models ridge_pairwise --strategies predicted_best,diverse_predicted_best"
+  smoke: ".venv/bin/python GLV_ML/active_learning.py GLV_ML/outputs/real_world/log/rw_summary.csv --target-species pathogen --output-dir GLV_ML/outputs/benchmarks/active_learning_smoke --initial-size 50 --batch-size 25 --rounds 2 --seeds 1 --models ridge_pairwise --strategies random,max_diversity"
   smoke_uncertainty: ".venv/bin/python GLV_ML/active_learning.py GLV_ML/outputs/real_world/log/rw_summary.csv --target-species pathogen --output-dir GLV_ML/outputs/benchmarks/active_learning_smoke --initial-size 50 --batch-size 25 --rounds 2 --seeds 1 --models ridge_pairwise --strategies ridge_posterior_uncertainty,ridge_posterior_ucb,committee_disagreement"
 ---
 
@@ -40,10 +42,12 @@ This domain must not grow `GLV_ML/ml_benchmark.py`. Shared loading/model behavio
 imported from that module, but model-dependent active-learning logic and acquisition
 bookkeeping live in `GLV_ML/active_learning.py`.
 
-Model-independent selection baselines (random, diversity, size-balanced) and the
-cross-family comparison live in their own domain — see `selection_baselines.spec.md`. That
-sibling imports this module's `round_metrics` / `summarize_rows` so its rounds CSV shares
-this schema and the two union directly.
+Composition-only acquisition controls (`random` and `max_diversity`) live here because
+their purpose is to create training sets and evaluate surrogate learning. Direct
+objective-guided searches such as greedy forward selection, hill climbing, simulated
+annealing, and genetic algorithms live in `selection_baselines.py`. That sibling imports
+this module's `round_metrics` / `summarize_rows` so its rounds CSV shares this schema and
+the two union directly.
 
 ## Script Split
 
@@ -55,6 +59,9 @@ this schema and the two union directly.
 4. Select `--batch-size 25` new communities with each acquisition strategy.
 5. Reveal their true target biomass from the oracle table.
 6. Retrain and repeat for `--rounds`, or until the acquisition pool is exhausted.
+7. Score the complete finite community table with the fitted surrogate, validate its
+   `--phase2-top-k` lowest predictions against the measured oracle, and report their
+   actual biomass.
 
 ## Core Questions
 
@@ -64,6 +71,8 @@ The active-learning benchmark tracks two separate questions:
   target biomass?
 - **Landscape learning:** how quickly does the surrogate become accurate over the
   broader candidate space?
+- **Landscape exploitation:** after training on `n` measurements, does the surrogate's
+  top-k recommendation approach the best community in the complete finite screen?
 
 These must be reported separately. A strategy can find good suppressors early while
 learning a poor global model, and a more exploratory strategy can learn the landscape
@@ -90,6 +99,11 @@ never acquired. The remaining rows are the acquisition pool. This avoids leakage
 RMSE/Spearman learning curves while still letting suppressor discovery operate over a
 realistic unmeasured candidate set.
 
+Phase 2 recommendation scoring is separate from model fitting. After fitting, the model
+may score the complete finite 11-partner screen, including audit compositions, because
+the recommendation is validated as an endpoint rather than added back to training. Audit
+labels remain hidden from fitting and acquisition.
+
 Initial measured rows should be stratified by `partner_count` where possible so the
 first 50 measurements do not collapse into one community size. Acquisition outputs must
 record `partner_count` so later comparisons can show whether a strategy only succeeds by
@@ -97,7 +111,11 @@ over-concentrating on one size class.
 
 ## Initial Strategies
 
-Implement these model-dependent strategies first in `active_learning.py`:
+Implement these acquisition strategies in `active_learning.py`:
+
+- `random`: uniform sampling without replacement from the unmeasured pool.
+- `max_diversity`: greedy farthest-point sampling by Hamming distance from all currently
+  measured and newly selected communities. It uses composition only.
 
 - `predicted_best`: lowest predicted target biomass among unmeasured communities.
 - `diverse_predicted_best`: low predicted biomass with Hamming-distance diversity.
@@ -115,6 +133,13 @@ Implement these model-dependent strategies first in `active_learning.py`:
 `ensemble_uncertainty` and `ucb_suppression` must use actual repeated surrogate fits
 to estimate prediction standard deviation. They should not fabricate uncertainty from a
 single point regressor.
+
+`random` and `max_diversity` are the default Phase 1 controls because they target broad
+coverage rather than immediate suppression. `predicted_best`,
+`diverse_predicted_best`, and `size_balanced_predicted_best` are exploitation-heavy
+diagnostics: they may remain available for comparison, but they are not the default answer
+to how a globally useful surrogate should acquire training data. Exact top-k predicted
+recommendations are evaluated separately as the Phase 2 endpoint.
 
 ## Uncertainty Estimation Methods
 
@@ -168,6 +193,12 @@ candidate universe is too large to score directly.
 - `global_best_biomass`
 - `global_best_gap`
 - `global_best_gap_fraction`
+- `complete_global_best_gap_fraction`
+- `surrogate_best_validated_biomass`
+- `surrogate_mean_validated_biomass`
+- `surrogate_global_best_biomass`
+- `surrogate_global_best_gap`
+- `surrogate_global_best_gap_fraction`
 - `suppressor_precision`
 - `suppressor_class_recall`
 - `suppressor_auprc`
@@ -190,8 +221,16 @@ candidate universe is too large to score directly.
 - `true_target_biomass`
 - optional `acquisition_score`
 
+`active_learning_recommendations.csv` contains each round's exact top-k surrogate
+recommendations with predicted and validated target biomass. These rows are evaluation
+endpoints and are never added to the measured training set.
+
 `active_learning_summary.csv` aggregates repeated seeds by model, strategy, and
 measured count. It is the main table for comparing measurement efficiency.
+
+For the current exhaustive real screen, Phase 2 uses exact predicted-best scoring over
+all compositions. Approximate landscape-walking optimizers are unnecessary at 11 partners
+and belong in the simulated scaling benchmark where exhaustive scoring is infeasible.
 
 ## Model Scope
 

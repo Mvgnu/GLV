@@ -41,11 +41,12 @@ when target-specific damping is needed.
 
 Generated GLV inputs support two generator modes. `--interaction-generator legacy`
 keeps the historical uniform off-diagonal draw and fixed diagonal. `hierarchical`
-adds species-level traits: earlier species receive higher dominance and larger
-carrying capacity, diagonal terms are set as `Aii = -growth_rate / carrying_capacity_i`,
-and off-diagonal effects include a coherent hierarchy term so dominant species exert
-broad similar effects across many recipients. This is intended for testing structured
-community landscapes rather than independent random interaction tables.
+adds species-level traits from a seeded low-discrepancy sequence. Every nested species
+prefix therefore spans suppressive and facilitative trait values without making earlier
+species systematically dominant. Trait values set carrying capacities, diagonal terms
+as `Aii = -growth_rate / carrying_capacity_i`, and coherent broad off-diagonal effects.
+This is intended for testing structured community landscapes rather than independent
+random interaction tables.
 
 `--target-interaction-scale` multiplies the target row's off-diagonal interactions
 after empirical priors are applied. Values below `1.0` damp direct partner pressure on
@@ -63,14 +64,17 @@ below `1e-6`, rather than integrating already-settled communities to the configu
 maximum time. Diagonal and off-diagonal matrices are prepared once per integration.
 
 Generated GLV inputs may also use empirical target-effect priors from
-`simulation_assay_noise.interaction_effect_prior.csv`. `--effect-prior-csv` applies
-main target effects to the target row of the GLV matrix, scaled by
-`--target-effect-scale`. Pairwise ridge effects are target-output epistasis rather
+`simulation_assay_noise.interaction_effect_prior.csv`. For covered species,
+`--effect-prior-csv` sets target-row interactions from matched-context main effects,
+scaled by `--target-effect-scale`. Matched-context pair effects are target-output epistasis rather
 than direct GLV parameters, so `--pair-effect-scale` maps them heuristically onto
 partner-partner interactions: positive pair coefficients become stronger partner
 competition, which can weaken combined suppression. This is a simulator axis for
-calibration experiments, not a claim that ridge coefficients are mechanistic `A_ij`
+calibration experiments, not a claim that empirical output effects are mechanistic `A_ij`
 values.
+
+The current real-data calibration uses `target_effect_scale = 0.3` and
+`pair_effect_scale = 2.5` without a partner-count correction.
 
 Target-species simulations set `--target-species`. In that mode the target species
 is included in every simulated community, `--community-size` / size ranges refer to

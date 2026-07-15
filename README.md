@@ -53,6 +53,8 @@ Used as a reference for fitting interaction-effect priors that mimic real-world 
   --carrying-capacity-max 2.0 \
   --hierarchy-strength 0.15 \
   --hierarchy-noise 0.02 \
+  --target-effect-scale 0.3 \
+  --pair-effect-scale 2.5 \
   --interaction-response saturating \
   --saturation-pressure 1.0 \
   --target-interaction-scale 1 \
@@ -76,14 +78,16 @@ Parameter notes:
 - `--strategies`: Phase 1 measurement/acquisition strategies that generate the training rows: `random`, `size_balanced`, `max_diversity`, and `bayesian_optimization`.
 - `--phase2-optimizers`: Phase 2 optimizers that walk either the trained surrogate landscape or the direct simulator baseline: `predicted_best`, `greedy_forward`, `simulated_annealing`, and `genetic_algorithm`.
 - `--phase2-top-k`: number of optimizer recommendations validated and reported.
-- `--interaction-generator`: generator used to create the GLV interaction table. `hierarchical` adds trait-like dominant species structure.
+- `--interaction-generator`: generator used to create the GLV interaction table. `hierarchical` assigns balanced broad-effect traits without ordering dominance by species ID.
 - `--carrying-capacity-min` / `--carrying-capacity-max`: range used to set species self-interaction strengths in the hierarchical generator.
 - `--hierarchy-strength`: strength of species-level hierarchy effects in generated interactions.
 - `--hierarchy-noise`: noise around the hierarchy effects.
+- `--target-effect-scale`: scale applied to matched-context real species marginals when setting covered target-row interactions.
+- `--pair-effect-scale`: scale mapping matched-context pair epistasis to partner competition; positive values weaken accumulated suppression.
 - `--interaction-response`: simulated landscape scaling accepts `saturating`; off-diagonal pressure is bounded inside the integrated GLV equations.
 - `--saturation-pressure`: pressure scale where saturating interactions begin to plateau.
 - `--target-interaction-scale`: multiplier for target-row interactions; useful as a diagnostic target-effect rescaling knob.
-- `--target-scale-mapping`: output mapping for target biomass. `quantile` maps latent biomass ranks to the real-world target distribution using an independent calibration landscape shared across species counts; `zscore` uses mean/std mapping; `latent` keeps GLV latent biomass.
+- `--target-scale-mapping`: output mapping for target biomass. `quantile` maps latent biomass ranks to the real-world target distribution using pooled independent calibration landscapes shared across species counts; `zscore` uses mean/std mapping; `latent` keeps GLV latent biomass.
 - `--assay-noise-scale`: multiplier for fitted assay noise. Use `0` for deterministic labels and `1` for calibrated lab-like noise.
 - `--output-dir`: output directory for run metadata, sampled pools, metrics, summaries, and plots.
 
@@ -272,10 +276,22 @@ Run calibration:
   --output-dir GLV_ML/outputs/calibration/suppressor_rates \
   --species-count 12 \
   --target-species sp_012 \
+  --target-effect-scales 0.3 \
+  --pair-effect-scales=2.5 \
+  --partner-count-effect-scales 0 \
+  --partner-count-effect-centers 5.5 \
+  --partner-count-effect-widths 2.0 \
+  --interaction-generator hierarchical \
+  --carrying-capacity-min 0.5 \
+  --carrying-capacity-max 2.0 \
+  --hierarchy-strength 0.15 \
+  --hierarchy-noise 0.02 \
   --interaction-response saturating \
   --saturation-pressure 1.0 \
   --endpoint-initial-density 0.5 \
   --endpoint-max-time 500 \
+  --target-scale-mapping quantile \
+  --assay-noise-scale 1 \
   --seed 42
 ```
 
@@ -285,6 +301,8 @@ Main outputs:
 GLV_ML/outputs/calibration/suppressor_rates/best_calibrated_interactions.csv
 GLV_ML/outputs/calibration/suppressor_rates/best_calibrated_summary.csv
 GLV_ML/outputs/calibration/suppressor_rates/suppressor_rate_calibration.csv
+GLV_ML/outputs/calibration/suppressor_rates/landscape_structure_metrics.csv
+GLV_ML/outputs/calibration/suppressor_rates/landscape_species_effects.csv
 ```
 
 ### `simulated_landscape_scaling.py`
@@ -318,6 +336,8 @@ Recommended first full run without Bayesian acquisition:
   --carrying-capacity-max 2.0 \
   --hierarchy-strength 0.15 \
   --hierarchy-noise 0.02 \
+  --target-effect-scale 0.3 \
+  --pair-effect-scale 2.5 \
   --interaction-response saturating \
   --saturation-pressure 1.0 \
   --target-interaction-scale 1 \
@@ -348,6 +368,8 @@ Noiseless diagnostic run:
   --carrying-capacity-max 2.0 \
   --hierarchy-strength 0.15 \
   --hierarchy-noise 0.02 \
+  --target-effect-scale 0.3 \
+  --pair-effect-scale 2.5 \
   --interaction-response saturating \
   --saturation-pressure 1.0 \
   --target-interaction-scale 1 \
@@ -372,13 +394,15 @@ directory is the run identity, so use a new directory for a scientifically diffe
 
 ### `active_learning.py`
 
-Replays model-dependent acquisition strategies over a fully materialized summary table. Use this for active-learning comparisons where the full oracle table already exists.
+Replays surrogate-training acquisition strategies over a fully materialized summary table.
+It also validates the fitted model's exact top-k recommendations over the finite real
+screen, separately from the best community acquired for training.
 
 Depends on:
 
 - a materialized summary CSV
 
-Run model-dependent acquisition strategies:
+Run surrogate-training acquisition strategies:
 
 ```bash
 .venv/bin/python GLV_ML/active_learning.py \
@@ -386,9 +410,11 @@ Run model-dependent acquisition strategies:
   --output-dir GLV_ML/outputs/benchmarks/active_learning/rw_log \
   --target-species pathogen \
   --models ridge_pairwise,random_forest,hist_gradient_boosting \
-  --strategies predicted_best,diverse_predicted_best,size_balanced_predicted_best,ensemble_uncertainty,bayesian_optimization \
+  --strategies random,max_diversity,ensemble_uncertainty,ucb_suppression \
   --initial-size 50 \
   --batch-size 25 \
+  --rounds 14 \
+  --phase2-top-k 5 \
   --seeds 5
 ```
 
@@ -408,8 +434,9 @@ Run model-independent baselines:
   --output-dir GLV_ML/outputs/benchmarks/selection_baselines/rw_log \
   --target-species pathogen \
   --models ridge_pairwise,random_forest,hist_gradient_boosting \
-  --methods random,greedy_forward,simulated_annealing,genetic_algorithm,max_diversity,size_balanced \
+  --methods greedy_forward,greedy_backward,hill_climb,simulated_annealing,genetic_algorithm,size_balanced \
   --batch-size 25 \
+  --rounds 16 \
   --seeds 5
 ```
 
@@ -427,7 +454,7 @@ Run comparison:
 ```bash
 .venv/bin/python GLV_ML/compare_selection_runs.py \
   --active-summary GLV_ML/outputs/benchmarks/active_learning/rw_log/active_learning_summary.csv \
-  --selection-summary GLV_ML/outputs/benchmarks/selection_baselines/rw_log/selection_baseline_summary.csv \
+  --selection-summary GLV_ML/outputs/benchmarks/selection_baselines/rw_log/selection_baselines_summary.csv \
   --output-dir GLV_ML/outputs/benchmarks/selection_comparison/rw_log
 ```
 
@@ -523,5 +550,5 @@ scaling_law_beta_recovery.csv
 
 - `--batch-size` controls acquisition batch size in some scripts. It does not automatically set reporting checkpoints unless the script says so; use explicit `--budgets` or `--train-sizes` when you need exact reporting points.
 - `--assay-noise-scale 0` gives deterministic/noiseless observed labels. `--assay-noise-scale 1` uses the fitted assay-noise scale.
-- `target-scale-mapping quantile` is the preferred noisy assay mode. It fits one mapping from an independent max-species calibration landscape for the run and reuses it across measured rows, audit rows, phase-2 validation, species-count prefixes, and seeds. `latent` keeps simulated target biomass on the GLV latent scale for noiseless mechanics checks. `zscore` uses the same independent calibration distribution with mean/std mapping.
+- `target-scale-mapping quantile` is the preferred noisy assay mode. It fits one mapping from five pooled independent max-species calibration landscapes and reuses it across measured rows, audit rows, phase-2 validation, species-count prefixes, and seeds. `latent` keeps simulated target biomass on the GLV latent scale for noiseless mechanics checks. `zscore` uses the same independent calibration distribution with mean/std mapping.
 - The GNN model is available as `gnn`, but it is slower than the other listed models.

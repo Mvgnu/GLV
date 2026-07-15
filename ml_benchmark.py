@@ -389,7 +389,8 @@ def build_regressor(model_name: str, seed: int):
             min_samples_leaf=2,
             max_features="sqrt",
             random_state=seed,
-            n_jobs=-1,
+            # Serial fitting avoids parallel memory peaks across long model sweeps.
+            n_jobs=1,
         )
 
     if model_name == "hist_gradient_boosting":

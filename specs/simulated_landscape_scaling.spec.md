@@ -56,7 +56,8 @@ The script does **not** enumerate every possible community by default. For each
 1. Generates one calibrated max-species GLV interaction table per seed.
 2. Takes each requested species count as a nested prefix of that same max-species
    universe, so species-count effects are not confounded with unrelated landscapes.
-3. Builds one independent max-species calibration landscape for target-scale mapping.
+3. Builds pooled independent max-species calibration landscapes for target-scale mapping,
+   so one unusually suppressive interaction table cannot set the scale.
 4. Samples a disjoint hidden audit pool uniformly from the requested community space.
 5. Lets each exploration strategy propose communities from the remaining combinatorial
    space.
@@ -84,6 +85,10 @@ per-community deterministic noise seeds make an interrupted invocation resumable
 manifest is informational and does not reject a resumed run through a configuration hash
 gate; use a new output directory for a scientifically different run. Evaluation datasets
 are assembled in memory, so the audit pool is not duplicated into one CSV per budget.
+Per-budget metric and Phase 2 checkpoints remain on disk during the sweep and are loaded
+only once for final aggregation. Resuming skips complete checkpoints without retaining
+their rows, and fitted estimators are released between checkpoints to keep memory bounded
+across multi-seed runs.
 
 ## Metrics
 
@@ -159,11 +164,15 @@ latent GLV biomass is mapped onto the real target scale. The default `1.0` prese
 calibrated lab-like noise. Use `0.0` for ideal deterministic labels when the question is
 how well models recover the simulator without measurement noise.
 
+Native `latent` targets must not be combined with real-assay noise. A run with a real
+summary, `target_scale_mapping = latent`, and non-zero assay noise fails before generating
+inputs because the real assay SD is not expressed in GLV biomass units.
+
 `--target-scale-mapping quantile` is preferred for noisy assay-like scaling runs. It maps
 latent GLV biomass ranks onto the empirical real-world pathogen-signal distribution
 before replicate noise is applied, avoiding absolute noise-scale mismatch between GLV
-units and assay units. The mapping reference comes from an independent max-species
-calibration landscape and is shared across every species-count prefix and seed. The
+units and assay units. The mapping reference pools five independent max-species
+calibration landscapes and is shared across every species-count prefix and seed. The
 audit distribution therefore remains hidden and species-count shifts are not separately
 normalized away.
 `latent` keeps simulated target biomass on the GLV scale and is preferred for noiseless
@@ -173,10 +182,10 @@ real-data sample extrema, avoiding an artificial shared best-biomass floor.
 Latent targets use raw fold suppressor thresholds (`median / suppressor_fold`) for audit
 metrics; real-scale targets use log-fold thresholds (`median - log(suppressor_fold)`).
 
-`--interaction-generator hierarchical` uses the trait-structured generator from the
-simulation domain. It should be evaluated alongside the legacy generator rather than
-replacing it, because the hierarchy terms are a simulator hypothesis rather than a
-validated biological mechanism.
+`--interaction-generator hierarchical` uses the balanced trait-structured generator from
+the simulation domain. Nested species-count prefixes retain broad trait coverage rather
+than assigning dominance by species index. It should be evaluated alongside the legacy
+generator because the hierarchy terms remain a simulator hypothesis.
 
 `--interaction-response saturating` replaces the linear off-diagonal pressure term with
 a bounded row-total response for every species equation. This is the preferred core
@@ -225,6 +234,23 @@ This answers the practical question: from what measured-row budget does a model 
 useful surrogate for landscape exploration? AUPRC, RMSE, and Spearman remain diagnostic
 model-quality metrics, but they should not be the sole endpoint because they can be opaque
 and threshold-dependent.
+
+## Extrapolation and Confounding Guardrails
+
+Calibration against the current real assay constrains an 11-partner system. Species added
+for 16-28-species simulations have no real interaction or plate-layout calibration, so
+those runs are synthetic sensitivity analyses, not validation that real larger microbial
+communities are learnable. Apparent partner-count effects in the real data may also include
+plate, dilution, or measurement-design effects. They must not be encoded as biological
+laws and then cited as evidence that the resulting synthetic landscapes are predictable.
+
+Overall model metrics can be inflated when target biomass differs mainly by partner count:
+a model may learn community cardinality without resolving which species composition works
+within a size. Therefore within-partner-count-band RMSE, Spearman, AUPRC, and validated
+Phase 2 recommendations are the primary scaling evidence. Overall metrics are supporting
+diagnostics. A calibrated regime and a generic/noise-free regime should be treated as
+separate sensitivity scenarios; agreement across them is stronger evidence than either
+scenario alone.
 
 Sequential oracle optimizers such as greedy local search, simulated annealing, and genetic
 algorithms are retained only as measurement-budgeted direct-search baselines. A neighbor,

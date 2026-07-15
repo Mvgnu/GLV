@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import itertools
 import json
 import math
@@ -19,6 +20,7 @@ import pandas as pd
 
 from calibrate_simulation_rates import (
     add_assay_observations,
+    validate_assay_mapping,
 )
 from active_learning import (
     bayesian_optimization_statistics,
@@ -38,6 +40,7 @@ from simulation_assay_noise import AssayNoiseModel, fit_assay_noise_model
 
 
 MAPPING_CALIBRATION_SIZE = 500
+MAPPING_CALIBRATION_LANDSCAPES = 5
 
 
 @dataclass(frozen=True)
@@ -1335,8 +1338,11 @@ def run_simulated_scaling(
     buffer_z: float,
     extinction_threshold: float,
 ) -> tuple[Path, Path, Path]:
-    if real_summary_path is None and target_scale_mapping != "latent":
-        raise ValueError("--real-summary is required for zscore or quantile target mapping")
+    validate_assay_mapping(
+        real_summary_path is not None,
+        target_scale_mapping,
+        assay_noise_scale,
+    )
     model_setup = model_configs(models)
     real_summary = pd.read_csv(real_summary_path) if real_summary_path else None
     noise_model = fit_assay_noise_model(real_summary)[0] if real_summary is not None else None
@@ -1401,6 +1407,7 @@ def run_simulated_scaling(
         "buffer_z": buffer_z,
         "extinction_threshold": extinction_threshold,
         "mapping_calibration_size": MAPPING_CALIBRATION_SIZE,
+        "mapping_calibration_landscapes": MAPPING_CALIBRATION_LANDSCAPES,
     }
     manifest_path = output_path / "run_config.json"
     if not manifest_path.exists():
@@ -1410,8 +1417,8 @@ def run_simulated_scaling(
     pools_path.mkdir(parents=True, exist_ok=True)
 
     run_rows = []
-    metric_rows = []
-    phase2_rows = []
+    metric_checkpoint_paths = []
+    phase2_checkpoint_paths = []
     max_species_count = max(species_counts)
     common_target_species = target_species or f"sp_{min(species_counts):03d}"
     interaction_generation_kwargs = {
@@ -1436,21 +1443,6 @@ def run_simulated_scaling(
     mapping_reference_values = None
     mapping_calibration_path = None
     if real_summary is not None and target_scale_mapping != "latent":
-        calibration_seed = base_seed + 1_000_000
-        calibration_interaction_path = (
-            inputs_path
-            / f"mapping_species_{max_species_count}_seed_{calibration_seed}_interactions.csv"
-        )
-        if calibration_interaction_path.exists():
-            calibration_interaction_data = pd.read_csv(calibration_interaction_path)
-        else:
-            calibration_interaction_data = generate_interaction_data(
-                species_count=max_species_count,
-                seed=calibration_seed,
-                **interaction_generation_kwargs,
-            )
-            calibration_interaction_data.to_csv(calibration_interaction_path, index=False)
-
         calibration_species = [
             f"sp_{index + 1:03d}" for index in range(max_species_count)
         ]
@@ -1470,31 +1462,58 @@ def run_simulated_scaling(
         )
         mapping_calibration_path = (
             inputs_path
-            / f"mapping_species_{max_species_count}_seed_{calibration_seed}_latent.csv"
+            / (
+                f"mapping_species_{max_species_count}_seed_{base_seed + 1_000_000}_"
+                f"{MAPPING_CALIBRATION_LANDSCAPES}"
+                "_landscapes_latent.csv"
+            )
         )
         if mapping_calibration_path.exists():
             mapping_calibration = pd.read_csv(mapping_calibration_path)
         else:
-            calibration_groups = sample_partner_groups(
-                calibration_partners,
-                calibration_partner_counts,
-                np.random.default_rng(calibration_seed),
-                count=calibration_group_count,
-            )
-            calibration_communities = [
-                tuple(sorted((*group, common_target_species)))
-                for group in calibration_groups
-            ]
-            mapping_calibration = simulate_communities(
-                calibration_interaction_data,
-                calibration_communities,
-                common_target_species,
-                extinction_threshold,
-                interaction_response,
-                saturation_pressure,
-                endpoint_initial_density,
-                endpoint_max_time,
-            )
+            calibration_summaries = []
+            for calibration_index in range(MAPPING_CALIBRATION_LANDSCAPES):
+                calibration_seed = base_seed + 1_000_000 + calibration_index
+                calibration_interaction_path = inputs_path / (
+                    f"mapping_species_{max_species_count}_seed_{calibration_seed}"
+                    "_interactions.csv"
+                )
+                if calibration_interaction_path.exists():
+                    calibration_interaction_data = pd.read_csv(
+                        calibration_interaction_path
+                    )
+                else:
+                    calibration_interaction_data = generate_interaction_data(
+                        species_count=max_species_count,
+                        seed=calibration_seed,
+                        **interaction_generation_kwargs,
+                    )
+                    calibration_interaction_data.to_csv(
+                        calibration_interaction_path,
+                        index=False,
+                    )
+
+                calibration_groups = sample_partner_groups(
+                    calibration_partners,
+                    calibration_partner_counts,
+                    np.random.default_rng(calibration_seed),
+                    count=calibration_group_count,
+                )
+                calibration_communities = [
+                    tuple(sorted((*group, common_target_species)))
+                    for group in calibration_groups
+                ]
+                calibration_summaries.append(simulate_communities(
+                    calibration_interaction_data,
+                    calibration_communities,
+                    common_target_species,
+                    extinction_threshold,
+                    interaction_response,
+                    saturation_pressure,
+                    endpoint_initial_density,
+                    endpoint_max_time,
+                ))
+            mapping_calibration = pd.concat(calibration_summaries, ignore_index=True)
             mapping_calibration.to_csv(mapping_calibration_path, index=False)
         mapping_reference_values = mapping_calibration[
             "latent_target_biomass"
@@ -1699,10 +1718,8 @@ def run_simulated_scaling(
                                 validated_summary["partner_count"].iloc[best_position]
                             ),
                         })
-                    pd.DataFrame(direct_optimizer_results).to_csv(direct_phase2_path, index=False)
-
-                for result in direct_optimizer_results:
-                    phase2_rows.append({
+                direct_rows = [
+                    {
                         "run_id": run_id,
                         "species_count": species_count,
                         "seed": run_seed,
@@ -1712,7 +1729,13 @@ def run_simulated_scaling(
                         "feature_set": "truth",
                         "measured_count": int(measured_count),
                         **result,
-                    })
+                    }
+                    for result in direct_optimizer_results
+                ]
+                # Complete older result-only checkpoints once, then leave them untouched.
+                if "run_id" not in direct_optimizer_results[0]:
+                    pd.DataFrame(direct_rows).to_csv(direct_phase2_path, index=False)
+                phase2_checkpoint_paths.append(direct_phase2_path)
 
             for strategy in strategies:
                 strategy_seed = run_seed + sum(ord(char) for char in strategy)
@@ -1762,9 +1785,9 @@ def run_simulated_scaling(
                     phase2_checkpoint_path = (
                         pools_path / f"{run_id}_{strategy}_{measured_count}_phase2.csv"
                     )
+                    metric_checkpoint_paths.append(metrics_checkpoint_path)
+                    phase2_checkpoint_paths.append(phase2_checkpoint_path)
                     if metrics_checkpoint_path.exists() and phase2_checkpoint_path.exists():
-                        metric_rows.extend(pd.read_csv(metrics_checkpoint_path).to_dict("records"))
-                        phase2_rows.extend(pd.read_csv(phase2_checkpoint_path).to_dict("records"))
                         continue
 
                     budget_metric_rows = []
@@ -1912,14 +1935,30 @@ def run_simulated_scaling(
                                 "best_recommended_community": validated_summary["community"].iloc[best_position],
                                 "best_recommended_partner_count": int(validated_summary["partner_count"].iloc[best_position]),
                             })
+                        del model, features, full_predictions, score_surrogate_groups, surrogate_scores
                     pd.DataFrame(budget_metric_rows).to_csv(metrics_checkpoint_path, index=False)
                     pd.DataFrame(budget_phase2_rows).to_csv(phase2_checkpoint_path, index=False)
-                    metric_rows.extend(budget_metric_rows)
-                    phase2_rows.extend(budget_phase2_rows)
+                    del (
+                        budget_metric_rows,
+                        budget_phase2_rows,
+                        dataset,
+                        measured_summary,
+                        evaluation_summary,
+                    )
+                    gc.collect()
+
+            del observed_evaluator, truth_evaluator, evaluator, score_direct_groups
+            gc.collect()
 
     runs = pd.DataFrame(run_rows)
-    metrics = pd.DataFrame(metric_rows)
-    phase2_metrics = pd.DataFrame(phase2_rows)
+    metrics = pd.concat(
+        (pd.read_csv(path) for path in metric_checkpoint_paths),
+        ignore_index=True,
+    )
+    phase2_metrics = pd.concat(
+        (pd.read_csv(path) for path in phase2_checkpoint_paths),
+        ignore_index=True,
+    )
     summary = summarize_metrics(metrics)
     phase2_summary = summarize_phase2_metrics(phase2_metrics)
     model_winners = best_model_by_band(
@@ -2052,8 +2091,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--endpoint-initial-density", type=float, default=0.5)
     parser.add_argument("--endpoint-max-time", type=float, default=500.0)
     parser.add_argument("--target-self-interaction", type=float, default=-1.0)
-    parser.add_argument("--target-effect-scale", type=float, default=0.25)
-    parser.add_argument("--pair-effect-scale", type=float, default=-0.5)
+    parser.add_argument("--target-effect-scale", type=float, default=0.3)
+    parser.add_argument("--pair-effect-scale", type=float, default=2.5)
     # Disabled by default so community-size suppression is measured, not imposed.
     parser.add_argument("--partner-count-effect-scale", type=float, default=0.0)
     parser.add_argument("--partner-count-effect-center", type=float, default=5.5)

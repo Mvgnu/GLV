@@ -13,11 +13,31 @@ import numpy as np
 import pandas as pd
 
 from lotka_volterra import generate_interaction_data, saturating_endpoint
-from simulation_assay_noise import AssayNoiseModel, fit_assay_noise_model, sample_assay_sd
+from ml_benchmark import dataset_from_summary
+from simulation_assay_noise import (
+    AssayNoiseModel,
+    fit_assay_noise_model,
+    matched_context_effects,
+    sample_assay_sd,
+)
 
 
 def parse_float_grid(value: str) -> list[float]:
     return [float(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def validate_assay_mapping(
+    has_real_summary: bool,
+    target_scale_mapping: str,
+    assay_noise_scale: float,
+) -> None:
+    if not has_real_summary and target_scale_mapping != "latent":
+        raise ValueError("--real-summary is required for zscore or quantile target mapping")
+    if has_real_summary and target_scale_mapping == "latent" and assay_noise_scale > 0:
+        raise ValueError(
+            "latent target mapping cannot use real-assay noise; use quantile mapping "
+            "or set --assay-noise-scale 0"
+        )
 
 
 def scale_seed(
@@ -67,6 +87,63 @@ def suppressor_rate_rows(
             "suppressor_cutoff": cutoff,
         })
     return rows
+
+
+def landscape_structure(
+    summary: pd.DataFrame,
+    source: str,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Measure marginal effects and pair epistasis in matched community contexts."""
+    values = summary["final_target_biomass"].to_numpy(dtype=float)
+    standardized = (values - float(np.mean(values))) / float(np.std(values))
+    dataset = dataset_from_summary(summary, None, None)
+    main, pair = matched_context_effects(dataset, standardized)
+    aggregates = {}
+    for label, effects in {"marginal": main, "pair": pair}.items():
+        comparisons = effects["comparisons"].to_numpy(dtype=float)
+        means = effects["coefficient"].to_numpy(dtype=float)
+        total = float(np.sum(comparisons))
+        mean = float(np.sum(comparisons * means) / total)
+        variance = float(np.sum(
+            comparisons
+            * (np.square(effects["context_sd"].to_numpy(dtype=float)) + np.square(means - mean))
+        ) / total)
+        aggregates[label] = {
+            "comparisons": int(total),
+            "mean": mean,
+            "sd": float(np.sqrt(variance)),
+            "negative_rate": float(
+                np.sum(comparisons * effects["negative_effect_rate"].to_numpy(dtype=float))
+                / total
+            ),
+        }
+
+    species_rows = [
+        {
+            "source": source,
+            "species": row.species_a,
+            "comparisons": int(row.comparisons),
+            "marginal_effect_mean": float(row.coefficient),
+            "marginal_effect_sd": float(row.context_sd),
+            "negative_effect_rate": float(row.negative_effect_rate),
+        }
+        for row in main.itertuples(index=False)
+    ]
+    metrics = {
+        "source": source,
+        "rows": len(summary),
+        "species_count": len(main),
+        "marginal_comparisons": aggregates["marginal"]["comparisons"],
+        "marginal_effect_mean": aggregates["marginal"]["mean"],
+        "marginal_effect_sd": aggregates["marginal"]["sd"],
+        "mean_species_context_sd": float(main["context_sd"].mean()),
+        "positive_mean_species_rate": float((main["coefficient"] > 0).mean()),
+        "pair_epistasis_comparisons": aggregates["pair"]["comparisons"],
+        "pair_epistasis_mean": aggregates["pair"]["mean"],
+        "pair_epistasis_sd": aggregates["pair"]["sd"],
+        "negative_pair_epistasis_rate": aggregates["pair"]["negative_rate"],
+    }
+    return metrics, species_rows
 
 
 def survivor_equilibrium(
@@ -389,18 +466,34 @@ def run_calibration(
     growth_rate: float,
     self_interaction: float,
     target_self_interaction: float | None,
+    interaction_generator: str,
+    carrying_capacity_min: float,
+    carrying_capacity_max: float,
+    hierarchy_strength: float,
+    hierarchy_noise: float,
+    target_interaction_scale: float,
     interaction_response: str,
     saturation_pressure: float,
     endpoint_initial_density: float,
     endpoint_max_time: float,
     suppressor_fold: float,
     by_count_weight: float,
+    assay_noise_scale: float,
+    target_scale_mapping: str,
+    mapping_reference_csv: str | None,
     extinction_threshold: float,
     seed: int,
 ) -> tuple[Path, Path, Path]:
+    validate_assay_mapping(True, target_scale_mapping, assay_noise_scale)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     real_summary = pd.read_csv(rw_summary_path)
+    noise_model = fit_assay_noise_model(real_summary)[0]
+    mapping_reference_values = (
+        pd.read_csv(mapping_reference_csv)["latent_target_biomass"].to_numpy(dtype=float)
+        if mapping_reference_csv
+        else None
+    )
     real_rates = pd.DataFrame(
         suppressor_rate_rows(real_summary, suppressor_fold, "real")
     )
@@ -408,7 +501,9 @@ def run_calibration(
 
     calibration_rows = []
     rate_rows = []
-    candidate_cache = {}
+    best_loss = float("inf")
+    best_interactions = None
+    best_summary = None
     for target_scale in target_effect_scales:
         for pair_scale in pair_effect_scales:
             interaction_data = generate_interaction_data(
@@ -424,6 +519,12 @@ def run_calibration(
                 target_effect_scale=target_scale,
                 pair_effect_scale=pair_scale,
                 seed=seed,
+                interaction_generator=interaction_generator,
+                carrying_capacity_min=carrying_capacity_min,
+                carrying_capacity_max=carrying_capacity_max,
+                hierarchy_strength=hierarchy_strength,
+                hierarchy_noise=hierarchy_noise,
+                target_interaction_scale=target_interaction_scale,
             )
             latent = endpoint_summary(
                 interaction_data,
@@ -434,6 +535,9 @@ def run_calibration(
                 endpoint_initial_density,
                 endpoint_max_time,
             )
+            latent = latent[
+                latent["partner_count"].isin(real_summary["partner_count"].unique())
+            ].reset_index(drop=True)
             for partner_count_scale in partner_count_effect_scales:
                 for partner_count_center in partner_count_effect_centers:
                     for partner_count_width in partner_count_effect_widths:
@@ -445,6 +549,14 @@ def run_calibration(
                             partner_count_center,
                             partner_count_width,
                             scale_seed(seed, target_scale, pair_scale, partner_count_scale),
+                            assay_noise_scale=assay_noise_scale,
+                            target_scale_mapping=target_scale_mapping,
+                            mapping_reference_values=(
+                                mapping_reference_values
+                                if mapping_reference_values is not None
+                                else latent["latent_target_biomass"].to_numpy(dtype=float)
+                            ),
+                            noise_model=noise_model,
                         )
                         simulated_rates = pd.DataFrame(
                             suppressor_rate_rows(simulated, suppressor_fold, "simulated")
@@ -475,15 +587,10 @@ def run_calibration(
                             "by_partner_count_rmse": by_count_rmse,
                             "simulated_overall_suppressor_rate": float(overall_rate),
                         })
-                        candidate_cache[
-                            (
-                                target_scale,
-                                pair_scale,
-                                partner_count_scale,
-                                partner_count_center,
-                                partner_count_width,
-                            )
-                        ] = (interaction_data, simulated)
+                        if loss < best_loss:
+                            best_loss = loss
+                            best_interactions = interaction_data.copy()
+                            best_summary = simulated.copy()
 
     calibration = pd.DataFrame(calibration_rows).sort_values("loss")
     calibration_path = output_path / "suppressor_rate_calibration.csv"
@@ -494,15 +601,6 @@ def run_calibration(
     )
     plot_calibration(calibration, output_path / "suppressor_rate_calibration.png")
 
-    best = calibration.iloc[0]
-    best_key = (
-        float(best["target_effect_scale"]),
-        float(best["pair_effect_scale"]),
-        float(best["partner_count_effect_scale"]),
-        float(best["partner_count_effect_center"]),
-        float(best["partner_count_effect_width"]),
-    )
-    best_interactions, best_summary = candidate_cache[best_key]
     best_interactions_path = output_path / "best_calibrated_interactions.csv"
     best_summary_path = output_path / "best_calibrated_summary.csv"
     best_interactions.to_csv(best_interactions_path, index=False)
@@ -517,6 +615,20 @@ def run_calibration(
     )
     best_rate_comparison.to_csv(
         output_path / "best_suppressor_rates.csv",
+        index=False,
+    )
+
+    real_structure, real_species_effects = landscape_structure(real_summary, "real")
+    simulated_structure, simulated_species_effects = landscape_structure(
+        best_summary,
+        "simulated",
+    )
+    pd.DataFrame([real_structure, simulated_structure]).to_csv(
+        output_path / "landscape_structure_metrics.csv",
+        index=False,
+    )
+    pd.DataFrame([*real_species_effects, *simulated_species_effects]).to_csv(
+        output_path / "landscape_species_effects.csv",
         index=False,
     )
 
@@ -547,6 +659,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-interaction", type=float, default=-1.0)
     parser.add_argument("--target-self-interaction", type=float, default=-1.0)
     parser.add_argument(
+        "--interaction-generator",
+        choices=["legacy", "hierarchical"],
+        default="legacy",
+    )
+    parser.add_argument("--carrying-capacity-min", type=float, default=1.0)
+    parser.add_argument("--carrying-capacity-max", type=float, default=1.0)
+    parser.add_argument("--hierarchy-strength", type=float, default=0.0)
+    parser.add_argument("--hierarchy-noise", type=float, default=0.0)
+    parser.add_argument("--target-interaction-scale", type=float, default=1.0)
+    parser.add_argument(
         "--interaction-response",
         choices=["linear", "saturating"],
         default="linear",
@@ -556,6 +678,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--endpoint-max-time", type=float, default=500.0)
     parser.add_argument("--suppressor-fold", type=float, default=2.0)
     parser.add_argument("--by-count-weight", type=float, default=1.0)
+    parser.add_argument("--assay-noise-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--target-scale-mapping",
+        choices=["zscore", "quantile", "latent"],
+        default="quantile",
+    )
+    parser.add_argument(
+        "--mapping-reference-csv",
+        help="Latent calibration summary used by fixed z-score or quantile mapping.",
+    )
     parser.add_argument("--extinction-threshold", type=float, default=1e-8)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -580,12 +712,21 @@ def main() -> None:
         growth_rate=args.growth_rate,
         self_interaction=args.self_interaction,
         target_self_interaction=args.target_self_interaction,
+        interaction_generator=args.interaction_generator,
+        carrying_capacity_min=args.carrying_capacity_min,
+        carrying_capacity_max=args.carrying_capacity_max,
+        hierarchy_strength=args.hierarchy_strength,
+        hierarchy_noise=args.hierarchy_noise,
+        target_interaction_scale=args.target_interaction_scale,
         interaction_response=args.interaction_response,
         saturation_pressure=args.saturation_pressure,
         endpoint_initial_density=args.endpoint_initial_density,
         endpoint_max_time=args.endpoint_max_time,
         suppressor_fold=args.suppressor_fold,
         by_count_weight=args.by_count_weight,
+        assay_noise_scale=args.assay_noise_scale,
+        target_scale_mapping=args.target_scale_mapping,
+        mapping_reference_csv=args.mapping_reference_csv,
         extinction_threshold=args.extinction_threshold,
         seed=args.seed,
     )

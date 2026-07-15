@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Model-independent search/selection methods for oracle-replay community discovery.
 
-These are the classic combinatorial selection heuristics (random, greedy forward/backward,
-hill climbing, simulated annealing) plus space-filling baselines. They are MODEL-INDEPENDENT:
+These are the classic objective-guided combinatorial selection heuristics (greedy
+forward/backward, hill climbing, simulated annealing, and genetic algorithms). They are
+MODEL-INDEPENDENT:
 each candidate a search evaluates is a real measurement (an oracle lookup of true target
 biomass), and the search navigates community space using only those true measured values.
 No surrogate is involved in deciding what to measure -- that was the circular sin of the old
@@ -287,27 +288,7 @@ def run_genetic_algorithm(oracle: Oracle, rng, valid_presence: np.ndarray, confi
         stalls = 0 if len(oracle.order) > before else stalls + 1
 
 
-# --- Space-filling baselines: composition-only orders, no oracle decisions. ---
-
-
-def random_positions(count: int, rng) -> list[int]:
-    return list(rng.permutation(count))
-
-
-def diversity_positions(presence: np.ndarray, rng) -> list[int]:
-    count = len(presence)
-    start = int(rng.integers(count))
-    order = [start]
-    chosen = np.zeros(count, dtype=bool)
-    chosen[start] = True
-    min_dist = np.abs(presence - presence[start]).sum(axis=1).astype(float)
-    for _ in range(count - 1):
-        masked = np.where(chosen, -1.0, min_dist)
-        nxt = int(np.argmax(masked))
-        order.append(nxt)
-        chosen[nxt] = True
-        min_dist = np.minimum(min_dist, np.abs(presence - presence[nxt]).sum(axis=1).astype(float))
-    return order
+# --- Partner-count coverage control: composition-only order, no oracle decisions. ---
 
 
 def size_balanced_positions(partner_counts: np.ndarray, rng) -> list[int]:
@@ -338,13 +319,8 @@ def measured_order(
     """Return the order in which a method measures distinct communities (row indices)."""
     oracle = Oracle(dataset, vector_index, valid_keys, budget)
 
-    if method in {"random", "max_diversity", "size_balanced"}:
-        if method == "random":
-            positions = random_positions(len(valid_keys), rng)
-        elif method == "max_diversity":
-            positions = diversity_positions(dataset.presence[valid_indices], rng)
-        else:
-            positions = size_balanced_positions(dataset.partner_counts[valid_indices], rng)
+    if method == "size_balanced":
+        positions = size_balanced_positions(dataset.partner_counts[valid_indices], rng)
         for position in positions:
             if oracle.done:
                 break
@@ -560,7 +536,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--methods",
-        default="random,greedy_forward,greedy_backward,hill_climb,simulated_annealing,genetic_algorithm,max_diversity,size_balanced",
+        default="greedy_forward,greedy_backward,hill_climb,simulated_annealing,genetic_algorithm,size_balanced",
         help="Model-independent search/selection methods to compare.",
     )
     parser.add_argument("--batch-size", type=int, default=25, help="Measured-count grid step.")

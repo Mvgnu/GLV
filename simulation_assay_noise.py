@@ -2,6 +2,7 @@
 """Calibrate real-world assay noise and apply it to GLV simulation summaries."""
 
 import argparse
+import itertools
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -153,6 +154,79 @@ def apply_assay_noise(
     return summary, pd.DataFrame(replicate_rows)
 
 
+def matched_context_effects(
+    dataset,
+    target_values: np.ndarray | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Estimate species marginals and pair epistasis from matched communities."""
+    values = dataset.target_biomass if target_values is None else target_values
+    community_values = {
+        tuple(np.flatnonzero(presence)): float(value)
+        for presence, value in zip(
+            dataset.presence,
+            values,
+            strict=True,
+        )
+    }
+    main_rows = []
+    for species_index, species in enumerate(dataset.partner_ids):
+        effects = []
+        for context, value in community_values.items():
+            if species_index in context:
+                continue
+            augmented = tuple(sorted((*context, species_index)))
+            if augmented in community_values:
+                effects.append(community_values[augmented] - value)
+        coefficient = float(np.mean(effects))
+        main_rows.append({
+            "feature_type": "main_effect",
+            "species_a": species,
+            "species_b": "",
+            "coefficient": coefficient,
+            "abs_coefficient": abs(coefficient),
+            "context_sd": float(np.std(effects)),
+            "negative_effect_rate": float(np.mean(np.asarray(effects) < 0)),
+            "comparisons": len(effects),
+        })
+
+    pair_rows = []
+    for first_index, second_index in itertools.combinations(
+        range(len(dataset.partner_ids)),
+        2,
+    ):
+        effects = []
+        for context, value in community_values.items():
+            if first_index in context or second_index in context:
+                continue
+            first = tuple(sorted((*context, first_index)))
+            second = tuple(sorted((*context, second_index)))
+            pair = tuple(sorted((*context, first_index, second_index)))
+            if (
+                first in community_values
+                and second in community_values
+                and pair in community_values
+            ):
+                effects.append(
+                    community_values[pair]
+                    - community_values[first]
+                    - community_values[second]
+                    + value
+                )
+        coefficient = float(np.mean(effects))
+        pair_rows.append({
+            "feature_type": "pairwise",
+            "species_a": dataset.partner_ids[first_index],
+            "species_b": dataset.partner_ids[second_index],
+            "coefficient": coefficient,
+            "abs_coefficient": abs(coefficient),
+            "context_sd": float(np.std(effects)),
+            "negative_effect_rate": float(np.mean(np.asarray(effects) < 0)),
+            "comparisons": len(effects),
+        })
+
+    return pd.DataFrame(main_rows), pd.DataFrame(pair_rows)
+
+
 def export_full_data_effects(
     summary_path: str,
     target_species: str | None,
@@ -175,12 +249,11 @@ def export_full_data_effects(
     effects_path = output_dir / "rw_ridge_pairwise_effects.csv"
     coefficients.to_csv(effects_path, index=False)
 
-    main = coefficients[coefficients["feature_type"] == "main_effect"].copy()
+    main, pairwise = matched_context_effects(dataset)
     main = main.sort_values("coefficient")
     main_path = output_dir / "rw_main_effects.csv"
     main.to_csv(main_path, index=False)
 
-    pairwise = coefficients[coefficients["feature_type"] == "pairwise"].copy()
     pairwise = pairwise.sort_values("coefficient")
     matrix = pd.DataFrame(
         np.nan,
